@@ -1,53 +1,46 @@
 -- 003_partitions.sql
--- Initial daily partitions for the logs table.
--- Range: 2026-08-09 to 2026-08-23 inclusive, 15 partitions total.
--- Each partition covers a 24-hour UTC window, half-open [FROM, TO).
--- Indexes defined on the parent (002_indexes.sql) are inherited
--- automatically by every partition created here.
--- Retention strategy documented in DESIGN.md.
-
-CREATE TABLE logs_2026_08_09
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-09 00:00:00+00') TO ('2026-08-10 00:00:00+00');
-CREATE TABLE logs_2026_08_10
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-10 00:00:00+00') TO ('2026-08-11 00:00:00+00');
-CREATE TABLE logs_2026_08_11
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-11 00:00:00+00') TO ('2026-08-12 00:00:00+00');
-CREATE TABLE logs_2026_08_12
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-12 00:00:00+00') TO ('2026-08-13 00:00:00+00');
-CREATE TABLE logs_2026_08_13
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-13 00:00:00+00') TO ('2026-08-14 00:00:00+00');
-CREATE TABLE logs_2026_08_14
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-14 00:00:00+00') TO ('2026-08-15 00:00:00+00');
-CREATE TABLE logs_2026_08_15
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-15 00:00:00+00') TO ('2026-08-16 00:00:00+00');
-CREATE TABLE logs_2026_08_16
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-16 00:00:00+00') TO ('2026-08-17 00:00:00+00');
-CREATE TABLE logs_2026_08_17
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-17 00:00:00+00') TO ('2026-08-18 00:00:00+00');
-CREATE TABLE logs_2026_08_18
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-18 00:00:00+00') TO ('2026-08-19 00:00:00+00');
-CREATE TABLE logs_2026_08_19
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-19 00:00:00+00') TO ('2026-08-20 00:00:00+00');
-CREATE TABLE logs_2026_08_20
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-20 00:00:00+00') TO ('2026-08-21 00:00:00+00');
-CREATE TABLE logs_2026_08_21
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-21 00:00:00+00') TO ('2026-08-22 00:00:00+00');
-CREATE TABLE logs_2026_08_22
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-22 00:00:00+00') TO ('2026-08-23 00:00:00+00');
-CREATE TABLE logs_2026_08_23
-    PARTITION OF logs
-    FOR VALUES FROM ('2026-08-23 00:00:00+00') TO ('2026-08-24 00:00:00+00');
+--
+-- INTENTIONALLY EMPTY. This migration performs no DDL.
+--
+-- It originally created 15 hardcoded daily partitions covering
+-- 2026-08-09 through 2026-08-23, as a deterministic bootstrap so the
+-- service had somewhere to write immediately after the first
+-- `docker compose up`. That bootstrap is now redundant and was removed.
+--
+-- Why it was removed
+--
+--   1. It is superseded. src/db/retention.ts runs a full provisioning
+--      pass during startup -- awaited, and fatal on failure, BEFORE
+--      /health can report ready. It creates every daily partition from
+--      RETENTION_DAYS in the past through PARTITION_LOOKAHEAD_DAYS in
+--      the future, which is a strict superset of what this file used
+--      to create. Proven live: dropping a partition by hand and
+--      restarting the app recreated it automatically
+--      ("Partition maintenance: +1 provisioned").
+--
+--   2. Its dates expired. Hardcoded bounds are deterministic, which is
+--      the property a migration must have -- but they are only USEFUL
+--      while the deployment date sits inside them. Deployed after
+--      2026-08-23, this file created 15 partitions in the past that the
+--      retention job then dropped within seconds of the same startup.
+--
+--   3. It masked a real defect. The incidental coverage of a couple of
+--      past days hid the fact that nothing provisioned the past at all.
+--      A log arriving late -- a buffered agent, a replayed dead-letter
+--      batch, a skewed clock -- passes validation (§8 bounds only the
+--      future) but had no partition to land in, so the COPY failed and
+--      returned 500, taking every valid entry in the same batch with
+--      it. Fixed by provisioning backwards across the retention window
+--      and rejecting anything older per-entry.
+--
+-- Why the file still exists rather than being deleted
+--
+--   Deleting it would leave a gap at 003 in a sequence the runner
+--   tracks by filename in schema_migrations. A future migration
+--   accidentally numbered 003 would then be skipped as "already
+--   applied" on any database that ran the original. Keeping an inert
+--   file makes that impossible and leaves the reasoning where the next
+--   reader will look for it.
+--
+-- Partition creation now lives entirely in the application layer; see
+-- src/db/retention.ts and the retention section of DESIGN.md.
