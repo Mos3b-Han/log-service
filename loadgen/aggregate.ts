@@ -1,0 +1,583 @@
+// loadgen/aggregate.ts
+//
+// Aggregation load generator. Measures GET /logs/aggregate latency
+// against the live dataset and produces the evidence for the spec's
+// "return the primary aggregation query in under 1 second at p95"
+// target.
+//
+// ---- Why this measures a SET of query shapes, not one query ----
+//
+// "The primary aggregation query" is not a single fixed request: bucket
+// size, grouping, time span, and which filters are attached all change
+// the work Postgres does. A single number would hide the shape that is
+// actually slow. This generator cycles through a representative set --
+// fine and coarse buckets, grouped and ungrouped, indexed filters
+// (service, attributes) and the deliberately unindexed one (message
+// substring, see CLAUDE.md §9) -- and reports percentiles per shape as
+// well as overall. The headline verdict uses the WORST shape's p95, so
+// the claim "aggregation p95 is under 1s" holds for every shape, not
+// just a favorable one.
+//
+// ---- Why the rate is paced on an absolute schedule ----
+//
+// The spec asks for "one aggregation request per second during the
+// ingestion test", so this is a fixed-rate (open-loop) workload, not a
+// saturation test. Request k is scheduled for `start + k * interval`
+// by wall clock. If a request runs long, the next one fires
+// immediately rather than sliding the whole schedule -- otherwise slow
+// responses would quietly reduce the offered rate and under-report
+// latency (coordinated omission).
+//
+// ---- Why the query ranges are discovered, not hardcoded ----
+//
+// Aggregating over a time range that holds no rows measures an empty
+// scan and proves nothing. Before measuring, this tool reads one real
+// row through the public API (GET /logs?limit=1) and derives the time
+// window, plus a real service name, attribute pair, and message word,
+// so every query it issues actually matches data.
+//
+// Configuration (all optional):
+//   LOADGEN_URL           base URL                 default http://localhost:8080
+//   LOADGEN_AGG_RATE      requests per second      default 1   (spec rate)
+//   LOADGEN_DURATION_SEC  measured seconds         default 60
+//   LOADGEN_WARMUP_SEC    unrecorded warmup        default 5
+//   LOADGEN_WINDOW_HOURS  span of the widest query default 24
+//   LOADGEN_API_KEY       bearer token             default none
+//   LOADGEN_UNTIL         ISO 8601 upper bound     default newest row
+//                         Set this (with LOADGEN_WINDOW_HOURS) to aim the
+//                         measurement at a specific slice of history --
+//                         e.g. a spec-shaped region of ~1M rows spread
+//                         over a month, rather than whatever the most
+//                         recent load-test run happened to leave behind.
+//
+// Run: npx tsx loadgen/aggregate.ts
+
+import {
+  summarizeLatencies,
+  formatLatencyBlock,
+  fmtInt,
+  fmtNum,
+  fmtMs,
+  type LatencySummary,
+} from './report.js';
+
+// ---------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------
+
+function envInt(name: string, dflt: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return dflt;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
+  return n;
+}
+
+function envNum(name: string, dflt: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return dflt;
+  const n = Number.parseFloat(raw);
+  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
+  return n;
+}
+
+const URL_BASE = (process.env['LOADGEN_URL'] ?? 'http://localhost:8080').replace(
+  /\/$/,
+  '',
+);
+const RATE_PER_SEC = envNum('LOADGEN_AGG_RATE', 1);
+const DURATION_SEC = envInt('LOADGEN_DURATION_SEC', 60);
+const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5);
+const WINDOW_HOURS = envInt('LOADGEN_WINDOW_HOURS', 24);
+const API_KEY = process.env['LOADGEN_API_KEY'];
+const UNTIL_OVERRIDE = process.env['LOADGEN_UNTIL'];
+
+const AGG_URL = `${URL_BASE}/logs/aggregate`;
+const LOGS_URL = `${URL_BASE}/logs`;
+const HEALTH_URL = `${URL_BASE}/health`;
+
+// The spec's hard target for this endpoint.
+const P95_TARGET_MS = 1000;
+
+const HEADERS: Record<string, string> = {};
+if (API_KEY) HEADERS['authorization'] = `Bearer ${API_KEY}`;
+
+const HOUR_MS = 3_600_000;
+
+// ---------------------------------------------------------------
+// Dataset discovery
+// ---------------------------------------------------------------
+
+interface Dataset {
+  /** Newest timestamp present, used as the upper bound of every range. */
+  readonly end: Date;
+  /** A service name that exists, for the filtered-query shape. */
+  readonly service: string;
+  /** A real attribute key/value pair, for the GIN-index shape. */
+  readonly attrKey: string | undefined;
+  readonly attrValue: string | undefined;
+  /** A word from a real message, for the unindexed substring shape. */
+  readonly word: string | undefined;
+}
+
+interface WireLogRow {
+  timestamp: string;
+  service: string;
+  message: string;
+  attributes: Record<string, string>;
+}
+
+async function discoverDataset(): Promise<Dataset> {
+  const res = await fetch(`${LOGS_URL}?limit=1`, { headers: HEADERS });
+  if (res.status !== 200) {
+    throw new Error(
+      `Dataset discovery failed: GET /logs returned ${res.status}. ` +
+        (res.status === 401
+          ? 'Auth is enabled; set LOADGEN_API_KEY.'
+          : await res.text()),
+    );
+  }
+  const body = (await res.json()) as { logs: WireLogRow[] };
+  const row = body.logs[0];
+  if (row === undefined) {
+    throw new Error(
+      'The service holds no logs. Run `npx tsx loadgen/ingest.ts` first ' +
+        'so there is something to aggregate.',
+    );
+  }
+
+  const end = UNTIL_OVERRIDE ? new Date(UNTIL_OVERRIDE) : new Date(row.timestamp);
+  if (Number.isNaN(end.getTime())) {
+    throw new Error(`Invalid LOADGEN_UNTIL: '${UNTIL_OVERRIDE}'`);
+  }
+
+  const attrEntries = Object.entries(row.attributes ?? {});
+  const firstAttr = attrEntries[0];
+
+  // First word of a real message, long enough to be a meaningful
+  // substring filter rather than matching everything.
+  const word = row.message
+    .split(/\s+/)
+    .find((w) => w.length >= 4)
+    ?.replace(/[^A-Za-z0-9]/g, '');
+
+  return {
+    end,
+    service: await discoverBusiestService(end),
+    attrKey: firstAttr?.[0],
+    attrValue: firstAttr?.[1],
+    word: word && word.length >= 4 ? word : undefined,
+  };
+}
+
+/**
+ * Find the service with the most rows in the measurement window.
+ *
+ * Picking the service off an arbitrary sample row is a trap: a service
+ * that owns three rows makes the "filtered query" shape return almost
+ * nothing, and the resulting single-digit millisecond timing says
+ * nothing about how the composite index performs at scale. Aggregating
+ * by service first and taking the largest gives a filter that actually
+ * exercises the index against real volume.
+ */
+async function discoverBusiestService(end: Date): Promise<string> {
+  const qs = new URLSearchParams({
+    since: isoOf(end, WINDOW_HOURS),
+    until: new Date(end.getTime() + 1000).toISOString(),
+    bucket: '1d',
+    group_by: 'service',
+  });
+  const res = await fetch(`${AGG_URL}?${qs.toString()}`, { headers: HEADERS });
+  if (res.status !== 200) {
+    throw new Error(
+      `Service discovery failed: GET /logs/aggregate returned ${res.status}`,
+    );
+  }
+  const body = (await res.json()) as {
+    buckets: { group: string | null; count: number }[];
+  };
+
+  // Sum per service across buckets, then take the maximum.
+  const totals = new Map<string, number>();
+  for (const b of body.buckets) {
+    if (b.group === null) continue;
+    totals.set(b.group, (totals.get(b.group) ?? 0) + b.count);
+  }
+  let best: { name: string; count: number } | undefined;
+  for (const [name, count] of totals) {
+    if (best === undefined || count > best.count) best = { name, count };
+  }
+  if (best === undefined) {
+    throw new Error('No services found in the measurement window.');
+  }
+  return best.name;
+}
+
+// ---------------------------------------------------------------
+// Query shapes
+// ---------------------------------------------------------------
+
+interface QueryShape {
+  readonly name: string;
+  /** What this shape is meant to stress, for the report. */
+  readonly exercises: string;
+  readonly query: string;
+}
+
+function isoOf(end: Date, hoursBack: number): string {
+  return new Date(end.getTime() - hoursBack * HOUR_MS).toISOString();
+}
+
+function buildShapes(ds: Dataset): QueryShape[] {
+  // `until` is exclusive, so push it just past the newest row to make
+  // sure that row is included in the range.
+  const until = new Date(ds.end.getTime() + 1000).toISOString();
+  const shapes: QueryShape[] = [];
+
+  const add = (
+    name: string,
+    exercises: string,
+    params: Record<string, string>,
+  ): void => {
+    const qs = new URLSearchParams({ until, ...params });
+    shapes.push({ name, exercises, query: qs.toString() });
+  };
+
+  // Fine granularity over a short window: many buckets, small scan.
+  add('1m / 1h / no group', 'date_bin at finest granularity', {
+    since: isoOf(ds.end, 1),
+    bucket: '1m',
+  });
+
+  // Same window, grouped: multiplies output rows by service cardinality.
+  add('1m / 1h / group=service', 'grouping multiplies bucket rows', {
+    since: isoOf(ds.end, 1),
+    bucket: '1m',
+    group_by: 'service',
+  });
+
+  // Medium window and bucket.
+  add('5m / 6h / group=service', 'wider scan, medium buckets', {
+    since: isoOf(ds.end, 6),
+    bucket: '5m',
+    group_by: 'service',
+  });
+
+  // Widest window, coarse buckets, grouped by the low-cardinality
+  // dimension. This is the closest shape to a typical dashboard panel.
+  add(`1h / ${WINDOW_HOURS}h / group=level`, 'widest scan, coarse buckets', {
+    since: isoOf(ds.end, WINDOW_HOURS),
+    bucket: '1h',
+    group_by: 'level',
+  });
+
+  // Same wide scan, but narrowed by an equality filter that the
+  // composite index (service, level, timestamp, id) can serve.
+  add(`1h / ${WINDOW_HOURS}h / service filter`, 'composite B-tree index', {
+    since: isoOf(ds.end, WINDOW_HOURS),
+    bucket: '1h',
+    service: ds.service,
+  });
+
+  // Attribute containment -- the GIN jsonb_path_ops path.
+  if (ds.attrKey !== undefined && ds.attrValue !== undefined) {
+    add(`1h / ${WINDOW_HOURS}h / attr filter`, 'GIN jsonb_path_ops index', {
+      since: isoOf(ds.end, WINDOW_HOURS),
+      bucket: '1h',
+      [`attr.${ds.attrKey}`]: ds.attrValue,
+    });
+  }
+
+  // Message substring -- deliberately unindexed (CLAUDE.md §9). Expected
+  // to be the slowest shape; measuring it is the point, since the README
+  // has to own this limitation honestly.
+  if (ds.word !== undefined) {
+    add(`1h / ${WINDOW_HOURS}h / q= substring`, 'UNINDEXED message ILIKE scan', {
+      since: isoOf(ds.end, WINDOW_HOURS),
+      bucket: '1h',
+      q: ds.word,
+    });
+  }
+
+  return shapes;
+}
+
+// ---------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------
+
+interface ShapeMetrics {
+  readonly shape: QueryShape;
+  latencies: number[];
+  ok: number;
+  badRequest: number;
+  failed: number;
+  bucketsReturned: number;
+  errorSample: string | undefined;
+}
+
+function newShapeMetrics(shape: QueryShape): ShapeMetrics {
+  return {
+    shape,
+    latencies: [],
+    ok: 0,
+    badRequest: 0,
+    failed: 0,
+    bucketsReturned: 0,
+    errorSample: undefined,
+  };
+}
+
+/**
+ * Issue one aggregation request and record the outcome.
+ */
+async function runOne(m: ShapeMetrics, record: boolean): Promise<void> {
+  const t0 = performance.now();
+  try {
+    const res = await fetch(`${AGG_URL}?${m.shape.query}`, { headers: HEADERS });
+    const elapsed = performance.now() - t0;
+
+    if (res.status === 200) {
+      const body = (await res.json()) as { buckets: unknown[] };
+      if (record) {
+        m.ok++;
+        m.bucketsReturned += body.buckets.length;
+        m.latencies.push(elapsed);
+      }
+    } else {
+      const text = await res.text();
+      if (record) {
+        if (res.status === 400) m.badRequest++;
+        else m.failed++;
+        m.latencies.push(elapsed);
+        m.errorSample ??= `HTTP ${res.status}: ${text.slice(0, 140)}`;
+      }
+    }
+  } catch (err) {
+    if (record) {
+      m.failed++;
+      m.errorSample ??= `network: ${(err as Error).message}`;
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// Paced runner
+// ---------------------------------------------------------------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Run for `durationSec`, issuing one request every `1/RATE_PER_SEC`
+ * seconds, cycling round-robin through the shapes so each accumulates
+ * an equal number of samples.
+ *
+ * Pacing is against an absolute schedule (start + k * interval) rather
+ * than "sleep(interval) after each response". With the naive approach a
+ * slow response delays every subsequent request, silently lowering the
+ * offered rate and hiding latency -- the classic coordinated-omission
+ * error in load tools.
+ */
+async function runPhase(
+  metrics: ShapeMetrics[],
+  durationSec: number,
+  record: boolean,
+  onTick?: (elapsedSec: number) => void,
+): Promise<void> {
+  const intervalMs = 1000 / RATE_PER_SEC;
+  const start = Date.now();
+  const endAt = start + durationSec * 1000;
+
+  // Requests are awaited one at a time: at 1 req/sec against a
+  // sub-second endpoint there is no need for concurrency, and serial
+  // execution keeps each measurement free of self-inflicted queueing.
+  for (let k = 0; Date.now() < endAt; k++) {
+    const due = start + k * intervalMs;
+    const wait = due - Date.now();
+    if (wait > 0) await sleep(wait);
+    if (Date.now() >= endAt) break;
+
+    const m = metrics[k % metrics.length]!;
+    await runOne(m, record);
+
+    if (record && onTick) onTick((Date.now() - start) / 1000);
+  }
+}
+
+// ---------------------------------------------------------------
+// Health gate
+// ---------------------------------------------------------------
+
+async function waitForHealth(): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  process.stdout.write(`Waiting for ${HEALTH_URL} ... `);
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(HEALTH_URL);
+      if (res.status === 200) {
+        await res.text();
+        process.stdout.write('ready.\n');
+        return;
+      }
+    } catch {
+      // not up yet
+    }
+    await sleep(500);
+  }
+  throw new Error(`Service did not become healthy at ${HEALTH_URL}`);
+}
+
+// ---------------------------------------------------------------
+// Report
+// ---------------------------------------------------------------
+
+function printReport(
+  metrics: ShapeMetrics[],
+  ds: Dataset,
+  wallSec: number,
+): void {
+  const line = '─'.repeat(72);
+  const all: number[] = [];
+  for (const m of metrics) all.push(...m.latencies);
+  const overall = summarizeLatencies(all);
+
+  const totalReq = metrics.reduce(
+    (n, m) => n + m.ok + m.badRequest + m.failed,
+    0,
+  );
+  const totalErrors = metrics.reduce((n, m) => n + m.badRequest + m.failed, 0);
+
+  console.log(`\n${line}`);
+  console.log('  AGGREGATION LATENCY REPORT');
+  console.log(line);
+  console.log('  Config');
+  console.log(`    url          : ${AGG_URL}`);
+  console.log(`    rate         : ${fmtNum(RATE_PER_SEC)} req/s (spec: 1/s)`);
+  console.log(`    duration     : ${fmtNum(wallSec)} s measured`);
+  console.log(`    auth         : ${API_KEY ? 'bearer token' : 'none'}`);
+  console.log(`    query shapes : ${metrics.length}`);
+  console.log('');
+  console.log('  Dataset window (discovered via GET /logs)');
+  console.log(`    newest row   : ${ds.end.toISOString()}`);
+  console.log(`    widest range : ${WINDOW_HOURS}h back from newest`);
+  console.log(`    filters used : service='${ds.service}'` +
+    `${ds.attrKey ? `, attr.${ds.attrKey}='${ds.attrValue}'` : ''}` +
+    `${ds.word ? `, q='${ds.word}'` : ''}`);
+  console.log('');
+  console.log('  Per-shape latency (ms)');
+  console.log(
+    `    ${'shape'.padEnd(34)} ${'n'.padStart(5)} ${'p50'.padStart(8)} ` +
+      `${'p95'.padStart(8)} ${'p99'.padStart(8)} ${'max'.padStart(8)}  buckets`,
+  );
+  for (const m of metrics) {
+    const s = summarizeLatencies(m.latencies);
+    const avgBuckets = m.ok > 0 ? m.bucketsReturned / m.ok : 0;
+    const flag = s.p95 > P95_TARGET_MS ? ' <-- OVER TARGET' : '';
+    console.log(
+      `    ${m.shape.name.padEnd(34)} ${fmtInt(s.count).padStart(5)} ` +
+        `${fmtNum(s.p50, 1).padStart(8)} ${fmtNum(s.p95, 1).padStart(8)} ` +
+        `${fmtNum(s.p99, 1).padStart(8)} ${fmtNum(s.max, 1).padStart(8)}  ` +
+        `${fmtInt(avgBuckets).padStart(7)}${flag}`,
+    );
+  }
+  console.log('');
+  console.log('  What each shape exercises');
+  for (const m of metrics) {
+    console.log(`    ${m.shape.name.padEnd(34)} ${m.shape.exercises}`);
+  }
+  console.log('');
+  console.log('  Overall latency (all shapes pooled)');
+  console.log(formatLatencyBlock(overall));
+  console.log('');
+
+  // The verdict uses the WORST shape, so the claim holds universally.
+  let worst: { name: string; s: LatencySummary } | undefined;
+  for (const m of metrics) {
+    const s = summarizeLatencies(m.latencies);
+    if (s.count === 0) continue;
+    if (worst === undefined || s.p95 > worst.s.p95) {
+      worst = { name: m.shape.name, s };
+    }
+  }
+
+  console.log('  Verdict');
+  console.log(`    target          : p95 < ${fmtInt(P95_TARGET_MS)} ms`);
+  console.log(`    requests        : ${fmtInt(totalReq)} (${fmtInt(totalErrors)} non-200)`);
+  console.log(`    overall p95     : ${fmtMs(overall.p95)}`);
+  if (worst) {
+    console.log(
+      `    worst shape p95 : ${fmtMs(worst.s.p95)}  (${worst.name})`,
+    );
+  }
+  const pass =
+    worst !== undefined && worst.s.p95 < P95_TARGET_MS && totalErrors === 0;
+  console.log(
+    `    result          : ${pass ? 'PASS — every shape under target' : 'REVIEW — see flagged rows above'}`,
+  );
+
+  const withErrors = metrics.filter((m) => m.errorSample !== undefined);
+  if (withErrors.length > 0) {
+    console.log('');
+    console.log('  Error samples');
+    for (const m of withErrors) {
+      console.log(`    ${m.shape.name}: ${m.errorSample}`);
+    }
+  }
+  console.log(line + '\n');
+}
+
+// ---------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------
+
+async function main(): Promise<void> {
+  console.log('Aggregation load generator');
+  console.log(
+    `  rate=${RATE_PER_SEC}/s duration=${DURATION_SEC}s ` +
+      `window=${WINDOW_HOURS}h warmup=${WARMUP_SEC}s`,
+  );
+
+  await waitForHealth();
+
+  process.stdout.write('Discovering dataset window ... ');
+  const ds = await discoverDataset();
+  console.log(`newest row ${ds.end.toISOString()}`);
+
+  const shapes = buildShapes(ds);
+  console.log(`Built ${shapes.length} query shapes.\n`);
+
+  if (WARMUP_SEC > 0) {
+    console.log(`Warmup ${WARMUP_SEC}s (not recorded — first run of each`);
+    console.log('shape pays cold shared-buffer cost)...');
+    const warm = shapes.map(newShapeMetrics);
+    await runPhase(warm, WARMUP_SEC, false);
+  }
+
+  console.log('\nMeasuring...');
+  const metrics = shapes.map(newShapeMetrics);
+  const start = Date.now();
+
+  let lastLogged = 0;
+  await runPhase(metrics, DURATION_SEC, true, (elapsed) => {
+    // One progress line every 10s so a 60s run stays readable.
+    if (elapsed - lastLogged >= 10) {
+      lastLogged = elapsed;
+      const done = metrics.reduce((n, m) => n + m.latencies.length, 0);
+      const pooled = summarizeLatencies(metrics.flatMap((m) => m.latencies));
+      console.log(
+        `  [${elapsed.toFixed(0).padStart(3)}s] requests=${fmtInt(done)}  ` +
+          `p95=${fmtMs(pooled.p95)}`,
+      );
+    }
+  });
+
+  const wallSec = (Date.now() - start) / 1000;
+  printReport(metrics, ds, wallSec);
+}
+
+main().catch((err) => {
+  console.error('Aggregation load generator failed:', err.message ?? err);
+  process.exit(1);
+});
