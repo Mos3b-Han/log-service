@@ -60,6 +60,7 @@ import {
   fmtMs,
   type LatencySummary,
 } from './report.js';
+import { discoverDataset, isoOf, type Dataset } from './discover.js';
 
 // ---------------------------------------------------------------
 // Configuration
@@ -102,117 +103,6 @@ const P95_TARGET_MS = 1000;
 const HEADERS: Record<string, string> = {};
 if (API_KEY) HEADERS['authorization'] = `Bearer ${API_KEY}`;
 
-const HOUR_MS = 3_600_000;
-
-// ---------------------------------------------------------------
-// Dataset discovery
-// ---------------------------------------------------------------
-
-interface Dataset {
-  /** Newest timestamp present, used as the upper bound of every range. */
-  readonly end: Date;
-  /** A service name that exists, for the filtered-query shape. */
-  readonly service: string;
-  /** A real attribute key/value pair, for the GIN-index shape. */
-  readonly attrKey: string | undefined;
-  readonly attrValue: string | undefined;
-  /** A word from a real message, for the unindexed substring shape. */
-  readonly word: string | undefined;
-}
-
-interface WireLogRow {
-  timestamp: string;
-  service: string;
-  message: string;
-  attributes: Record<string, string>;
-}
-
-async function discoverDataset(): Promise<Dataset> {
-  const res = await fetch(`${LOGS_URL}?limit=1`, { headers: HEADERS });
-  if (res.status !== 200) {
-    throw new Error(
-      `Dataset discovery failed: GET /logs returned ${res.status}. ` +
-        (res.status === 401
-          ? 'Auth is enabled; set LOADGEN_API_KEY.'
-          : await res.text()),
-    );
-  }
-  const body = (await res.json()) as { logs: WireLogRow[] };
-  const row = body.logs[0];
-  if (row === undefined) {
-    throw new Error(
-      'The service holds no logs. Run `npx tsx loadgen/ingest.ts` first ' +
-        'so there is something to aggregate.',
-    );
-  }
-
-  const end = UNTIL_OVERRIDE ? new Date(UNTIL_OVERRIDE) : new Date(row.timestamp);
-  if (Number.isNaN(end.getTime())) {
-    throw new Error(`Invalid LOADGEN_UNTIL: '${UNTIL_OVERRIDE}'`);
-  }
-
-  const attrEntries = Object.entries(row.attributes ?? {});
-  const firstAttr = attrEntries[0];
-
-  // First word of a real message, long enough to be a meaningful
-  // substring filter rather than matching everything.
-  const word = row.message
-    .split(/\s+/)
-    .find((w) => w.length >= 4)
-    ?.replace(/[^A-Za-z0-9]/g, '');
-
-  return {
-    end,
-    service: await discoverBusiestService(end),
-    attrKey: firstAttr?.[0],
-    attrValue: firstAttr?.[1],
-    word: word && word.length >= 4 ? word : undefined,
-  };
-}
-
-/**
- * Find the service with the most rows in the measurement window.
- *
- * Picking the service off an arbitrary sample row is a trap: a service
- * that owns three rows makes the "filtered query" shape return almost
- * nothing, and the resulting single-digit millisecond timing says
- * nothing about how the composite index performs at scale. Aggregating
- * by service first and taking the largest gives a filter that actually
- * exercises the index against real volume.
- */
-async function discoverBusiestService(end: Date): Promise<string> {
-  const qs = new URLSearchParams({
-    since: isoOf(end, WINDOW_HOURS),
-    until: new Date(end.getTime() + 1000).toISOString(),
-    bucket: '1d',
-    group_by: 'service',
-  });
-  const res = await fetch(`${AGG_URL}?${qs.toString()}`, { headers: HEADERS });
-  if (res.status !== 200) {
-    throw new Error(
-      `Service discovery failed: GET /logs/aggregate returned ${res.status}`,
-    );
-  }
-  const body = (await res.json()) as {
-    buckets: { group: string | null; count: number }[];
-  };
-
-  // Sum per service across buckets, then take the maximum.
-  const totals = new Map<string, number>();
-  for (const b of body.buckets) {
-    if (b.group === null) continue;
-    totals.set(b.group, (totals.get(b.group) ?? 0) + b.count);
-  }
-  let best: { name: string; count: number } | undefined;
-  for (const [name, count] of totals) {
-    if (best === undefined || count > best.count) best = { name, count };
-  }
-  if (best === undefined) {
-    throw new Error('No services found in the measurement window.');
-  }
-  return best.name;
-}
-
 // ---------------------------------------------------------------
 // Query shapes
 // ---------------------------------------------------------------
@@ -222,10 +112,6 @@ interface QueryShape {
   /** What this shape is meant to stress, for the report. */
   readonly exercises: string;
   readonly query: string;
-}
-
-function isoOf(end: Date, hoursBack: number): string {
-  return new Date(end.getTime() - hoursBack * HOUR_MS).toISOString();
 }
 
 function buildShapes(ds: Dataset): QueryShape[] {
@@ -542,7 +428,12 @@ async function main(): Promise<void> {
   await waitForHealth();
 
   process.stdout.write('Discovering dataset window ... ');
-  const ds = await discoverDataset();
+  const ds = await discoverDataset(
+    URL_BASE,
+    HEADERS,
+    WINDOW_HOURS,
+    UNTIL_OVERRIDE,
+  );
   console.log(`newest row ${ds.end.toISOString()}`);
 
   const shapes = buildShapes(ds);
