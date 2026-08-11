@@ -38,6 +38,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-logs}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-logs}
       POSTGRES_DB: ${POSTGRES_DB:-logs}
+      # Optional auth, off by default. Passing these through keeps the
+      # zero-config default (AUTH_ENABLED=false) while letting the CI
+      # matrix run `AUTH_ENABLED=true LOADGEN_API_KEY=... docker compose up`.
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      LOADGEN_API_KEY: ${LOADGEN_API_KEY:-}
     deploy:
       resources:
         limits:

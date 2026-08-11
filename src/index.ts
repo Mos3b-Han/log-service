@@ -13,6 +13,7 @@ import { checkConnection } from './db/pool.js';
 import { runMigrations } from './db/migrate.js';
 import { server } from './http/server.js';
 import { registerErrorHandler } from './http/errorHandler.js';
+import { registerAuth } from './http/middleware/auth.js';
 import { registerHealthRoute } from './http/routes/health.js';
 import { registerIngestRoute } from './http/routes/ingest.js';
 import { registerQueryRoute } from './http/routes/query.js';
@@ -33,8 +34,13 @@ async function main() {
   // Step 3: apply any pending migrations.
   await runMigrations();
 
-  // Step 4: wire up HTTP layer.
+  // Step 4: wire up HTTP layer. Auth is registered before the routes
+  // so its onRequest hook (when enabled) guards every data endpoint;
+  // when disabled it installs nothing and /health stays exempt either
+  // way. Seeding happens here, before listen, so a valid credential
+  // exists the moment the service reports ready.
   registerErrorHandler(server);
+  registerAuth(server);
   await registerHealthRoute(server);
   await registerIngestRoute(server);
   await registerQueryRoute(server);
