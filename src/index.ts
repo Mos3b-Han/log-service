@@ -11,6 +11,10 @@
 import { config } from './config.js';
 import { checkConnection } from './db/pool.js';
 import { runMigrations } from './db/migrate.js';
+import {
+  runPartitionMaintenance,
+  startPartitionMaintenance,
+} from './db/retention.js';
 import { server } from './http/server.js';
 import { registerErrorHandler } from './http/errorHandler.js';
 import { registerAuth } from './http/middleware/auth.js';
@@ -34,6 +38,12 @@ async function main() {
   // Step 3: apply any pending migrations.
   await runMigrations();
 
+  // Step 3b: provision partitions before accepting any logs. An insert
+  // with no target partition fails outright, so this must succeed
+  // before the service reports ready. Retention (dropping expired
+  // partitions) runs in the same cycle but is best-effort.
+  await runPartitionMaintenance();
+
   // Step 4: wire up HTTP layer. Auth is registered before the routes
   // so its onRequest hook (when enabled) guards every data endpoint;
   // when disabled it installs nothing and /health stays exempt either
@@ -53,6 +63,11 @@ async function main() {
   // Step 6: only now is the service truly ready.
   setReady();
   console.log('Service is ready.');
+
+  // Step 7: start the background partition maintenance cycle. The timer
+  // is unref'd, so it never keeps the process alive on its own; the
+  // shutdown handler stops it explicitly.
+  startPartitionMaintenance();
 }
 
 main().catch((err) => {
