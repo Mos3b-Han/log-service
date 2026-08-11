@@ -4,8 +4,6 @@ services:
     restart: unless-stopped
     cpus: 1.0
     mem_limit: 1g
-    ports:
-      - "5432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-logs}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-logs}
@@ -48,6 +46,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Probe the real readiness endpoint from inside the container.
+    # /health returns 503 until migrations are applied and setReady()
+    # runs, so `wget` exits non-zero and the container stays
+    # "unhealthy" until the service can actually accept logs. This is
+    # what makes `docker compose up --wait` gate on true readiness
+    # rather than mere process start. BusyBox wget (already in the
+    # node:20-alpine image) exits 0 only on a 2xx response.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
 volumes:
   postgres-data:
