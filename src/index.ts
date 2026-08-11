@@ -22,10 +22,15 @@ import { registerHealthRoute } from './http/routes/health.js';
 import { registerIngestRoute } from './http/routes/ingest.js';
 import { registerQueryRoute } from './http/routes/query.js';
 import { registerAggregateRoute } from './http/routes/aggregate.js';
+import { registerShutdownHandlers } from './shutdown.js';
 import { setReady } from './readiness.js';
 
 async function main() {
   console.log('Starting log-service...');
+
+  // Register signal handlers first so a SIGTERM during startup (e.g. a
+  // fast container restart) still triggers an orderly shutdown.
+  registerShutdownHandlers();
 
   // Step 1: config is already loaded at import time. If it threw,
   // we never reach this line — that is intentional (fail fast).
