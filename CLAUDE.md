@@ -141,8 +141,23 @@ Do not re-decide these. They are set.
 
 ### Retention strategy
 - **Range partitioning** on the timestamp column (daily partitions)
-- Retention implemented by `DROP TABLE` on old partitions, never `DELETE`
-- Partitions are created ahead of time by a scheduled task
+- Retention implemented by `DROP TABLE` on old partitions, never
+  `DELETE`
+- Partition lifecycle management (both creating future partitions
+  and dropping expired ones) lives in the **Node.js application
+  layer**, not in PL/pgSQL — for testability, metrics, logging,
+  and graceful shutdown
+- A SQL view `logs_partitions` (migrations/004_retention.sql)
+  exposes partition metadata (name, lower_bound, upper_bound);
+  it contains no scheduling or orchestration logic
+- Two distinct responsibilities share one run cycle:
+  - **Provisioning**: ensure partitions exist for the next
+    `PARTITION_LOOKAHEAD_DAYS` days — prevents ingestion from
+    failing outright if the job is delayed
+  - **Retention**: drop partitions older than `RETENTION_DAYS`
+- Provisioning is prioritized over retention in failure impact:
+  missing partitions break ingestion entirely, while delayed
+  retention only means data outlives its policy briefly
 
 ### Attribute storage
 - Attributes stored as `JSONB` column on the logs table
@@ -187,75 +202,79 @@ files. The final tree looks like:
 
 ```
 log-service/
-├── docker-compose.yml
+│
+├── migrations/                     # raw SQL، كل ملف مرحلة واحدة
+│   ├── 001_schema.sql
+│   ├── 002_indexes.sql
+│   ├── 003_partitions.sql
+│   └── 004_retention.sql
+│
+├── loadgen/                        # أدوات القياس (تغذّي PERFORMANCE.md)
+│   ├── ingest.ts
+│   ├── query.ts
+│   ├── aggregate.ts
+│   ├── mixed.ts                    # query أثناء ingest ← سيناريو التقييم
+│   └── report.ts                   # p50/p95/p99
+│
+├── tests/
+│   ├── unit/                       # core النقي، بلا DB
+│   ├── integration/                # endpoints + Postgres حقيقية
+│   └── contract/                   # شكل الـ API حرفياً
+│
+├── src/
+│   ├── index.ts                    # bootstrap: pool → migrate → server
+│   ├── config.ts                   # القراءة الوحيدة لـ process.env
+│   ├── readiness.ts                # DB connected + migrations applied
+│   ├── shutdown.ts                 # graceful drain
+│   │
+│   ├── http/                       # كل ما يخص HTTP، لا SQL هنا
+│   │   ├── server.ts
+│   │   ├── errorHandler.ts         # يحوّل أخطاء core/db لـ 400/429/500
+│   │   ├── routes/
+│   │   │   ├── health.ts
+│   │   │   ├── ingest.ts           # handler رقيق: validate(core) → write(db)
+│   │   │   ├── query.ts
+│   │   │   └── aggregate.ts
+│   │   └── middleware/
+│   │       └── auth.ts             # off by default؛ hook للـ AUTH_ENABLED
+│   │
+│   ├── core/                       # نقي، بلا I/O، بلا استيراد http أو db
+│   │   ├── types.ts
+│   │   ├── levels.ts               # debug↔0 … error↔3
+│   │   ├── validation/
+│   │   │   ├── validateEntry.ts
+│   │   │   ├── validateBatch.ts    # → { accepted[], rejected[] }
+│   │   │   └── validateQuery.ts    # فلاتر + aggregate params
+│   │   ├── pagination/
+│   │   │   └── cursor.ts           # encode/decode base64 فقط
+│   │   └── time/
+│   │       └── buckets.ts          # 1m/5m/1h/1d → date_bin args
+│   │
+│   ├── db/                         # كل الـ SQL هنا
+│   │   ├── pool.ts
+│   │   ├── migrate.ts              # runner للـ migrations
+│   │   ├── writer.ts               # COPY متزامن + backpressure
+│   │   ├── query/
+│   │   │   ├── filters.ts          # بناء WHERE بارامترياً (مشترك)
+│   │   │   ├── list.ts             # GET /logs + شرط الـ keyset
+│   │   │   └── aggregate.ts        # GET /logs/aggregate
+│   │   └── retention.ts            # DROP partition
+│   │
+│   └── observability/
+│       ├── metrics.ts              # عدّادات مجمّعة، لا log لكل سطر
+│       └── logger.ts               # أحداث تشغيل فقط
+│
+├── .github/workflows/ci.yml        # smoke في كلا الـ AUTH configs
 ├── Dockerfile
-├── .dockerignore
-├── .env.example
-├── .gitignore
-├── .github/
-│   └── workflows/
-│       └── ci.yml
-├── README.md
-├── DESIGN.md
-├── PERFORMANCE.md
-├── CLAUDE.md                       ← this file
+├── docker-compose.yml
 ├── package.json
 ├── tsconfig.json
-├── drizzle.config.ts
-├── migrations/                     ← raw SQL migration files
-│   ├── 001_init.sql
-│   ├── 002_partitions.sql
-│   └── 003_retention.sql
-├── loadgen/                        ← author's own load generator
-│   ├── ingest.ts
-│   └── query.ts
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── contract/
-└── src/
-    ├── index.ts
-    ├── config.ts
-    ├── shutdown.ts
-    ├── readiness.ts
-    ├── http/
-    │   ├── server.ts
-    │   ├── errorHandler.ts
-    │   ├── routes/
-    │   │   ├── health.ts
-    │   │   ├── ingest.ts
-    │   │   ├── query.ts
-    │   │   └── aggregate.ts
-    │   └── middleware/
-    │       ├── auth.ts
-    │       └── requestLog.ts
-    ├── core/                       ← pure, no I/O, no imports from http or db
-    │   ├── types.ts
-    │   ├── validation/
-    │   │   ├── validateEntry.ts
-    │   │   ├── validateBatch.ts
-    │   │   └── validateFilters.ts
-    │   ├── pagination/
-    │   │   ├── cursor.ts
-    │   │   └── keyset.ts
-    │   └── time/
-    │       └── buckets.ts
-    ├── db/
-    │   ├── schema.ts               ← Drizzle schema
-    │   ├── pool.ts
-    │   ├── migrate.ts
-    │   ├── queryBuilder.ts
-    │   ├── writer/
-    │   │   ├── buffer.ts
-    │   │   ├── batchWriter.ts
-    │   │   └── backpressure.ts
-    │   ├── queries/
-    │   │   ├── list.ts
-    │   │   └── aggregate.ts
-    │   └── retention.ts
-    └── observability/
-        ├── metrics.ts
-        └── logger.ts
+├── .env.example
+├── .gitignore
+├── .dockerignore
+├── README.md
+├── DESIGN.md                       # أهم 5 قرارات + البدائل المرفوضة
+└── PERFORMANCE.md                  # EXPLAIN ANALYZE + أرقام القياس
 ```
 
 ---
@@ -495,7 +514,7 @@ BUFFER_MAX_ROWS            = 500
 BUFFER_MAX_LATENCY_MS      = 200
 INGEST_BODY_LIMIT_BYTES    = 8 MB
 RETENTION_DAYS             = 30
-PARTITION_LOOKAHEAD_DAYS   = 7
+PARTITION_LOOKAHEAD_DAYS   = 14
 ```
 
 All configurable via env vars, all documented in `.env.example`.
