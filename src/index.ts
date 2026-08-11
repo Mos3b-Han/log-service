@@ -1,36 +1,52 @@
 // src/index.ts
 //
 // Application entry point. Boot sequence:
-//   1. Verify the config module loads without throwing (fail fast on
-//      malformed environment variables).
-//   2. Verify Postgres is actually reachable.
-//   3. Start the HTTP server listening on all interfaces.
-//
-// This is an intentionally minimal first version -- just enough to
-// prove the full chain works end to end (config -> pool -> Postgres
-// -> Fastify -> a real HTTP response). The `/health` route here will
-// be replaced by a fuller readiness check (DB + migrations applied)
-// in a later session.
+//   1. Load config (fail fast on malformed env vars).
+//   2. Verify Postgres is reachable.
+//   3. Run migrations (apply any unapplied .sql files).
+//   4. Register HTTP routes and error handler.
+//   5. Start listening.
+//   6. Mark the service as ready (/health returns 200 from here).
 
-import Fastify from 'fastify';
 import { config } from './config.js';
 import { checkConnection } from './db/pool.js';
+import { runMigrations } from './db/migrate.js';
+import { server } from './http/server.js';
+import { registerErrorHandler } from './http/errorHandler.js';
+import { registerHealthRoute } from './http/routes/health.js';
+import { registerIngestRoute } from './http/routes/ingest.js';
+import { registerQueryRoute } from './http/routes/query.js';
+import { registerAggregateRoute } from './http/routes/aggregate.js';
+import { setReady } from './readiness.js';
 
 async function main() {
   console.log('Starting log-service...');
 
+  // Step 1: config is already loaded at import time. If it threw,
+  // we never reach this line — that is intentional (fail fast).
+
+  // Step 2: verify Postgres connectivity before anything else.
   console.log('Checking Postgres connection...');
   await checkConnection();
   console.log('Postgres connection OK.');
 
-  const server = Fastify({ logger: false });
+  // Step 3: apply any pending migrations.
+  await runMigrations();
 
-  server.get('/health', async (_request, reply) => {
-    reply.code(200).send({ status: 'ok' });
-  });
+  // Step 4: wire up HTTP layer.
+  registerErrorHandler(server);
+  await registerHealthRoute(server);
+  await registerIngestRoute(server);
+  await registerQueryRoute(server);
+  await registerAggregateRoute(server);
 
+  // Step 5: start listening on all interfaces (required for Docker).
   await server.listen({ port: config.port, host: '0.0.0.0' });
   console.log(`log-service listening on port ${config.port}`);
+
+  // Step 6: only now is the service truly ready.
+  setReady();
+  console.log('Service is ready.');
 }
 
 main().catch((err) => {
