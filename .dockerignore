@@ -1,0 +1,10 @@
+node_modules
+dist
+tests
+loadgen
+.git
+.gitignore
+.env
+.env.example
+*.md
+.claude
