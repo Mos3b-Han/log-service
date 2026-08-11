@@ -26,6 +26,7 @@
 import type { FastifyInstance } from 'fastify';
 import { validateBatch } from '../../core/validation/validateBatch.js';
 import { write, BackpressureError } from '../../db/writer.js';
+import { config } from '../../config.js';
 
 export async function registerIngestRoute(
   app: FastifyInstance,
@@ -34,7 +35,13 @@ export async function registerIngestRoute(
     // Fastify has already parsed JSON and enforced the body-size
     // limit (config.ingest.bodyLimitBytes). If the body was not
     // valid JSON, Fastify replied 400 before we got here.
-    const outcome = validateBatch(request.body);
+    // retentionDays comes from config here, not from inside core: the
+    // core layer never reads process.env. It bounds how far into the
+    // past a timestamp may be, since only that window has partitions.
+    const outcome = validateBatch(
+      request.body,
+      config.retention.retentionDays,
+    );
 
     // Shape errors: request body is malformed at the envelope level.
     // Route responds 400 with just { error } -- per-entry details do

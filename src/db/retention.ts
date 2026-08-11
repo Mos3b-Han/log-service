@@ -81,13 +81,36 @@ function boundLiteral(dayStart: Date): string {
 // ---------------------------------------------------------------
 
 /**
- * Ensure a daily partition exists for today and the next
- * PARTITION_LOOKAHEAD_DAYS days. Returns how many were created. New
- * partitions automatically inherit the parent's composite and GIN
- * indexes (a property of CREATE TABLE ... PARTITION OF).
+ * Ensure a daily partition exists across the whole storable window:
+ * from RETENTION_DAYS in the past through PARTITION_LOOKAHEAD_DAYS in
+ * the future. Returns how many were created. New partitions inherit
+ * the parent's composite and GIN indexes automatically (a property of
+ * CREATE TABLE ... PARTITION OF).
+ *
+ * Why the window reaches backwards as well as forwards:
+ *
+ * Log delivery is not ordered or instantaneous. An agent that buffered
+ * during a network outage, a batch replayed from a dead-letter queue,
+ * or a host with a skewed clock all produce entries timestamped in the
+ * past. Those entries pass validation (§8 only bounds the FUTURE, by
+ * five minutes), so if no partition covers their day the INSERT fails
+ * with "no partition of relation logs found for row" -- surfacing as a
+ * 500 that takes the entire batch down with it, including every valid
+ * entry alongside it.
+ *
+ * Provisioning the full retention window closes that gap: any entry we
+ * are willing to KEEP (i.e. inside RETENTION_DAYS) now has somewhere to
+ * land. Entries older than the window are rejected per-entry by the
+ * validator instead, so the batch survives.
+ *
+ * The backward bound deliberately matches the retention cutoff, so
+ * provisioning and retention never fight: the oldest day this creates
+ * has an upper bound strictly greater than the drop cutoff, and so is
+ * never immediately dropped by the same cycle.
  */
 async function provisionPartitions(): Promise<number> {
   const lookahead = config.retention.partitionLookaheadDays;
+  const retentionDays = config.retention.retentionDays;
   const today = todayUtc();
 
   // Names that already exist, so we only issue CREATE for real gaps and
@@ -98,7 +121,7 @@ async function provisionPartitions(): Promise<number> {
   const existing = new Set(existingResult.rows.map((r) => r.partition_name));
 
   let created = 0;
-  for (let i = 0; i <= lookahead; i++) {
+  for (let i = -retentionDays; i <= lookahead; i++) {
     const dayStart = new Date(today.getTime() + i * DAY_MS);
     const name = partitionName(dayStart);
     if (existing.has(name)) continue;

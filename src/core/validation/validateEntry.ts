@@ -162,6 +162,14 @@ function validateAttributes(
  * @param now   Current wall time in milliseconds. MUST be computed
  *              once by the caller before entering its batch loop;
  *              CLAUDE.md §11 forbids Date.now() inside the loop.
+ * @param minTimestampMs
+ *              Earliest instant we can actually store: the start of the
+ *              oldest retained UTC day. Entries older than this have no
+ *              partition to land in, and creating one would immediately
+ *              be undone by the retention job. Rejecting them HERE, as a
+ *              per-entry result, is what keeps a single stale entry from
+ *              failing its whole batch with a 500 (§8: one invalid entry
+ *              must not fail the batch).
  * @returns     `{ ok: true, value: LogEntry }` when valid, otherwise
  *              `{ ok: false, reason: <human message> }`. The reason
  *              string is what the client sees in the rejected[] list;
@@ -171,6 +179,7 @@ function validateAttributes(
 export function validateEntry(
   raw: unknown,
   now: number,
+  minTimestampMs: number,
 ): ValidationResult<LogEntry> {
   if (!isPlainObject(raw)) {
     return { ok: false, reason: 'entry must be an object' };
@@ -192,6 +201,19 @@ export function validateEntry(
     return {
       ok: false,
       reason: 'timestamp is more than 5 minutes in the future',
+    };
+  }
+  if (parsedMs < minTimestampMs) {
+    // Older than the retention window: there is no partition for this
+    // day and there never will be, since retention would drop it. The
+    // date is included so a client can see exactly where the boundary
+    // is rather than guessing.
+    return {
+      ok: false,
+      reason:
+        'timestamp predates the retention window (earliest retained: ' +
+        new Date(minTimestampMs).toISOString() +
+        ')',
     };
   }
 

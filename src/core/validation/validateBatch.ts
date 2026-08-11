@@ -52,13 +52,35 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   );
 }
 
+const DAY_MS = 86_400_000;
+
+/**
+ * Start of the current UTC day, in milliseconds. Partitions are daily
+ * and aligned to UTC midnight, so the storable boundary has to be too:
+ * using `now - retentionDays * DAY` directly would reject entries from
+ * earlier in the oldest retained day even though its partition exists
+ * and would accept them.
+ */
+function startOfUtcDayMs(now: number): number {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
 /**
  * Validate a full request body. Never throws.
  *
- * @param rawBody  The parsed JSON body from the HTTP request. May be
- *                 anything -- the caller has not inspected it yet.
+ * @param rawBody       The parsed JSON body from the HTTP request. May
+ *                      be anything -- the caller has not inspected it.
+ * @param retentionDays How many days of history the service keeps.
+ *                      Supplied by the caller from config (the core
+ *                      layer never reads process.env). Entries older
+ *                      than this window are rejected per-entry, because
+ *                      no partition covers them; see validateEntry.
  */
-export function validateBatch(rawBody: unknown): BatchOutcome {
+export function validateBatch(
+  rawBody: unknown,
+  retentionDays: number,
+): BatchOutcome {
   if (!isPlainObject(rawBody)) {
     return { ok: false, reason: 'request body must be a JSON object' };
   }
@@ -85,6 +107,12 @@ export function validateBatch(rawBody: unknown): BatchOutcome {
   // discipline is what keeps hot paths honest.
   const now = Date.now();
 
+  // The earliest instant that has a partition to land in: the start of
+  // the oldest retained UTC day. Computed once here, alongside `now`,
+  // for the same reason -- per-entry recomputation is wasted work and
+  // would let the boundary drift mid-batch.
+  const minTimestampMs = startOfUtcDayMs(now) - retentionDays * DAY_MS;
+
   const accepted: LogEntry[] = [];
   const rejected: RejectedEntry[] = [];
 
@@ -93,7 +121,7 @@ export function validateBatch(rawBody: unknown): BatchOutcome {
   // ValidationResult objects the size of the batch, then throw it
   // away. The direct loop touches each entry exactly once.
   for (let i = 0; i < logs.length; i++) {
-    const result = validateEntry(logs[i], now);
+    const result = validateEntry(logs[i], now, minTimestampMs);
     if (result.ok) {
       accepted.push(result.value);
     } else {
