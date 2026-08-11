@@ -99,20 +99,39 @@ check_eq "returns 200" "200" "$(get_status "${BASE_URL}/health")"
 check_eq "unauthenticated even with auth on" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' "${BASE_URL}/health")"
 
-# ---- 2. auth gate (mode-dependent) ----------------------------------
+# ---- 2. auth gate (auto-detected, not assumed from API_KEY) ---------
 echo ""
-echo "[2] Auth behavior"
-if [ -n "$API_KEY" ]; then
-  check_eq "data endpoint without token -> 401" "401" \
+# Detect the actual mode by probing a data endpoint with no credential:
+# 401 means auth is enforced, anything else means it is off. This makes
+# the script correct whether or not API_KEY happens to be set.
+NOAUTH_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${BASE_URL}/logs?service=probe")
+if [ "$NOAUTH_STATUS" = "401" ]; then
+  echo "[2] Auth behavior (detected: enforced)"
+  if [ -z "$API_KEY" ]; then
+    fail "service enforces auth but no API_KEY set"
+    echo ""
+    echo "  This service requires a credential. Re-run with the key:"
+    echo "    API_KEY=<your key> BASE_URL=${BASE_URL} scripts/smoke.sh"
+    echo ""
+    echo "────────────────────────────────────────────"
+    echo "  PASS: ${PASS}   FAIL: ${FAIL}   (aborted early)"
+    echo "────────────────────────────────────────────"
+    exit 1
+  fi
+  check_eq "no token -> 401" "401" \
     "$(curl -s -o /dev/null -w '%{http_code}' "${BASE_URL}/logs?service=${SVC}")"
-  check_eq "data endpoint with wrong token -> 401" "401" \
+  check_eq "wrong token -> 401" "401" \
     "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer nope' "${BASE_URL}/logs?service=${SVC}")"
-  check_eq "data endpoint with correct token -> 200" "200" \
+  check_eq "correct token -> 200" "200" \
     "$(get_status "${BASE_URL}/logs?service=${SVC}")"
 else
+  echo "[2] Auth behavior (detected: off)"
   # Auth off: an unrecognized Authorization header must be IGNORED.
   check_eq "unrecognized bearer ignored (not rejected) -> 200" "200" \
     "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer bogus' "${BASE_URL}/logs?service=${SVC}")"
+  if [ -n "$API_KEY" ]; then
+    echo "  note: API_KEY was set but the service has auth off — token is ignored"
+  fi
 fi
 
 # ---- 3. POST /logs ingest -------------------------------------------
