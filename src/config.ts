@@ -32,6 +32,7 @@ interface Config {
     readonly writer: {
       readonly bufferMaxRows: number;
       readonly bufferMaxLatencyMs: number;
+      readonly maxPendingRows: number;
     };
   
     readonly retention: {
@@ -100,6 +101,11 @@ interface Config {
     writer: {
       bufferMaxRows: readInt('BUFFER_MAX_ROWS', 500),
       bufferMaxLatencyMs: readInt('BUFFER_MAX_LATENCY_MS', 200),
+      // Hard cap on rows buffered but not yet written. Reached only if
+      // Postgres cannot keep up; new writes then get 429. Sized to
+      // absorb realistic concurrency bursts (~6MB at this default)
+      // while staying a small fraction of the 256MB app budget.
+      maxPendingRows: readInt('BUFFER_MAX_PENDING_ROWS', 20000),
     },
   
     retention: {

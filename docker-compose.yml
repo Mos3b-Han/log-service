@@ -43,6 +43,13 @@ services:
       # matrix run `AUTH_ENABLED=true LOADGEN_API_KEY=... docker compose up`.
       AUTH_ENABLED: ${AUTH_ENABLED:-false}
       LOADGEN_API_KEY: ${LOADGEN_API_KEY:-}
+      # Write-path tuning, forwarded so the documented knobs actually
+      # take effect in the container. Defaults match src/config.ts, so
+      # a plain `docker compose up` behaves identically to leaving them
+      # unset.
+      BUFFER_MAX_ROWS: ${BUFFER_MAX_ROWS:-500}
+      BUFFER_MAX_LATENCY_MS: ${BUFFER_MAX_LATENCY_MS:-200}
+      BUFFER_MAX_PENDING_ROWS: ${BUFFER_MAX_PENDING_ROWS:-20000}
     deploy:
       resources:
         limits:

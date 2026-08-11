@@ -87,10 +87,13 @@ let activeFlush: Promise<void> | null = null;
 let flushTimer: NodeJS.Timeout | null = null;
 let closed = false;
 
-// Hard cap: 10x the flush trigger. The gap lets a slow Postgres
-// absorb bursts without immediately rejecting new writes. If we ever
-// see 429s in normal operation, this ratio is the first knob.
-const HARD_CAP_ROWS = config.writer.bufferMaxRows * 10;
+// Hard cap on buffered-but-unwritten rows. Reached only when Postgres
+// cannot drain as fast as clients submit; new writes then get a typed
+// BackpressureError (429). Sized (config default 20,000 rows, ~6MB) to
+// absorb realistic concurrency bursts -- a closed loop of C workers can
+// momentarily pile up C x batch rows during one flush -- while bounding
+// memory well under the 256MB app budget.
+const HARD_CAP_ROWS = config.writer.maxPendingRows;
 
 // -----------------------------------------------------------------
 // Public API
