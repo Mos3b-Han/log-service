@@ -21,6 +21,22 @@
 //   LOADGEN_TOTAL_LOGS    if set, run until this many logs are sent
 //                         (count mode, no warmup) instead of by time
 //   LOADGEN_API_KEY       bearer token          default none
+//   LOADGEN_SPREAD_DAYS   spread timestamps over this many days back
+//                         instead of the last 60 seconds. default 0
+//
+// About LOADGEN_SPREAD_DAYS: by default this tool timestamps every
+// entry within the last 60 seconds, which is what a live log stream
+// looks like and is the right shape for measuring peak write
+// throughput. It is the WRONG shape for measuring read latency: all
+// rows land in a single daily partition, so partition pruning has
+// nothing useful to skip and every aggregation scans the whole
+// dataset. Setting LOADGEN_SPREAD_DAYS=30 spreads entries evenly
+// across the last 30 days instead, reproducing the "~1M rows
+// representing about a month" dataset the spec describes.
+//
+// The target partitions must already exist -- run
+// `scripts/seed-history.sh 30` first, since the service only ever
+// provisions partitions forward in time.
 //
 // Run: npx tsx loadgen/ingest.ts
 
@@ -57,6 +73,14 @@ const TOTAL_LOGS = process.env['LOADGEN_TOTAL_LOGS']
   ? envInt('LOADGEN_TOTAL_LOGS', 0)
   : undefined;
 const API_KEY = process.env['LOADGEN_API_KEY'];
+const SPREAD_DAYS = process.env['LOADGEN_SPREAD_DAYS']
+  ? envInt('LOADGEN_SPREAD_DAYS', 0)
+  : 0;
+
+// How far back entry timestamps may fall. Default is the last 60
+// seconds (live-stream shape); LOADGEN_SPREAD_DAYS widens it to build
+// a historical dataset for read-latency testing.
+const SPREAD_MS = SPREAD_DAYS > 0 ? SPREAD_DAYS * 86_400_000 : 60_000;
 
 const INGEST_URL = `${URL_BASE.replace(/\/$/, '')}/logs`;
 const HEALTH_URL = `${URL_BASE.replace(/\/$/, '')}/health`;
@@ -86,8 +110,15 @@ function pick<T>(arr: readonly T[]): T {
   return arr[(Math.random() * arr.length) | 0]!;
 }
 
+// Math.floor, not `| 0`. The bitwise form coerces through ToInt32, so
+// any value above 2^31-1 wraps to a negative number. That is harmless
+// for small ranges but silently breaks LOADGEN_SPREAD_DAYS: a 30-day
+// spread is 2,592,000,000 ms, past the int32 limit, so ~17% of draws
+// came back negative and `now - negative` produced FUTURE timestamps
+// that the service then correctly rejected -- making a working service
+// look like it was dropping 17% of a valid workload.
 function randInt(maxExclusive: number): number {
-  return (Math.random() * maxExclusive) | 0;
+  return Math.floor(Math.random() * maxExclusive);
 }
 
 interface WireEntry {
@@ -99,14 +130,15 @@ interface WireEntry {
 }
 
 // Build one batch. `nowMs` is computed once per batch by the caller.
-// Timestamps are jittered across the last 60s so the resulting dataset
-// spreads over time (useful for the later time-bucket query tests) and
-// is always a valid, non-future value.
+// Timestamps are jittered backwards across SPREAD_MS (60s by default,
+// or LOADGEN_SPREAD_DAYS worth of history when set), so every value is
+// in the past and therefore always passes the "not more than 5 minutes
+// in the future" validation rule.
 function makeBatchBody(nowMs: number): string {
   const logs: WireEntry[] = new Array(BATCH_SIZE);
   for (let i = 0; i < BATCH_SIZE; i++) {
     logs[i] = {
-      timestamp: new Date(nowMs - randInt(60_000)).toISOString(),
+      timestamp: new Date(nowMs - randInt(SPREAD_MS)).toISOString(),
       level: pick(LEVELS),
       service: pick(SERVICES),
       message: pick(MESSAGES),
