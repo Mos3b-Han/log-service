@@ -1,47 +1,4 @@
-// loadgen/mixed.ts
-//
-// The grading scenario: query while ingesting. Runs three workloads
-// concurrently against the same instance and reports whether the read
-// path holds up while the write path is saturated.
-//
-//   1. Ingest    -- N concurrent workers POSTing batches, as fast as
-//                   the service accepts them.
-//   2. Aggregate -- one GET /logs/aggregate per second, the rate the
-//                   spec explicitly asks the service to sustain during
-//                   the ingestion test.
-//   3. Freshness -- periodically writes a uniquely-marked entry, then
-//                   polls GET /logs until that exact entry is visible,
-//                   measuring the write-to-readable delay.
-//
-// It exists because the three targets it covers cannot be proven by
-// running the ingest and aggregate generators separately:
-//
-//   - "Maintain query performance while ingestion is active"
-//   - "Support one aggregation request per second during the
-//      ingestion test"
-//   - "Make newly ingested data queryable within 20 seconds"
-//
-// The last one is the reason the freshness probe writes a marker rather
-// than inferring from counters: the only honest proof that a specific
-// accepted write became readable is to read that specific write back.
-//
-// Interpreting the output: compare the aggregation percentiles here
-// against a quiet-system baseline from `npx tsx loadgen/aggregate.ts`.
-// The delta is the real answer to "does ingestion hurt queries", and a
-// number that barely moves is worth far more in the write-up than a
-// good absolute figure with nothing to compare it to.
-//
-// Configuration (all optional):
-//   LOADGEN_URL              base URL              default http://localhost:8080
-//   LOADGEN_DURATION_SEC     measured seconds      default 60
-//   LOADGEN_WARMUP_SEC       unrecorded warmup     default 5
-//   LOADGEN_BATCH_SIZE       logs per POST         default 500
-//   LOADGEN_CONCURRENCY      ingest workers        default 16
-//   LOADGEN_AGG_RATE         aggregations/sec      default 1  (spec rate)
-//   LOADGEN_WINDOW_HOURS     aggregation span      default 1
-//   LOADGEN_FRESHNESS_EVERY_SEC  freshness probes  default 10
-//   LOADGEN_API_KEY          bearer token          default none
-//
+
 // Run: npx tsx loadgen/mixed.ts
 
 import {
@@ -65,9 +22,6 @@ import {
   waitForHealth,
 } from './util.js';
 
-// ---------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------
 
 const URL_BASE = baseUrl();
 const DURATION_SEC = envInt('LOADGEN_DURATION_SEC', 60);
@@ -93,9 +47,6 @@ const JSON_HEADERS: Record<string, string> = {
   ...GET_HEADERS,
 };
 
-// ---------------------------------------------------------------
-// Synthetic data
-// ---------------------------------------------------------------
 
 const SERVICES = [
   'checkout', 'auth', 'api', 'payments', 'search',
@@ -129,9 +80,6 @@ function makeBatchBody(nowMs: number): string {
   return JSON.stringify({ logs });
 }
 
-// ---------------------------------------------------------------
-// Shared state
-// ---------------------------------------------------------------
 
 interface Metrics {
   // ingest
@@ -148,17 +96,11 @@ interface Metrics {
   aggFailed: number;
   aggLatencies: number[];
   aggNetworkFailures: number;
-  // The aggregation driver's own active window. The achieved rate must
-  // be computed against THIS, not the run's total wall time: Promise.all
-  // keeps the phase alive until every ingest worker drains its in-flight
-  // request, which inflates wall time by a second or two and would make
-  // a perfectly paced 1.00 req/s report as ~0.89 req/s.
+  
   aggStartMs: number;
   aggEndMs: number;
-  // freshness
   freshnessSamples: number[];
   freshnessTimeouts: number;
-  // diagnostics
   errorSamples: string[];
 }
 
@@ -177,9 +119,6 @@ function noteError(m: Metrics, msg: string): void {
   if (m.errorSamples.length < 8) m.errorSamples.push(msg);
 }
 
-// ---------------------------------------------------------------
-// Workload 1: ingest
-// ---------------------------------------------------------------
 
 async function ingestWorker(
   m: Metrics,
@@ -215,15 +154,7 @@ async function ingestWorker(
   }
 }
 
-// ---------------------------------------------------------------
-// Workload 2: aggregation at a fixed rate
-// ---------------------------------------------------------------
 
-/**
- * Paced on an absolute schedule so a slow response does not silently
- * reduce the offered rate (coordinated omission). The query window
- * tracks "now" on every request, matching how a live dashboard polls.
- */
 async function aggregateDriver(
   m: Metrics,
   record: boolean,
@@ -273,25 +204,6 @@ async function aggregateDriver(
   if (record) m.aggEndMs = Date.now();
 }
 
-// ---------------------------------------------------------------
-// Workload 3: freshness probe
-// ---------------------------------------------------------------
-
-/**
- * Write one uniquely-marked entry, then poll GET /logs until that exact
- * entry comes back, and record how long it took.
- *
- * This is the only honest way to measure the spec's "newly ingested
- * data is queryable within 20 seconds": inferring it from buffer
- * settings or row counts would be an argument, not a measurement. The
- * marker service name makes the query exact -- it matches this probe's
- * entry and nothing else, even while thousands of other rows per second
- * are landing.
- *
- * The clock starts before the POST, so the reported number includes
- * validation, buffering, the COPY, commit, and the read path -- the
- * full path a user actually waits on.
- */
 async function freshnessDriver(
   m: Metrics,
   record: boolean,
@@ -329,9 +241,7 @@ async function freshnessDriver(
       continue;
     }
 
-    // Poll until visible or the target elapses. 250ms is fine enough to
-    // resolve a sub-second result without adding load next to the
-    // ingest workers.
+    
     let visible = false;
     while (performance.now() - t0 < FRESHNESS_TARGET_MS) {
       const q = await timedFetch(
@@ -362,10 +272,6 @@ async function freshnessDriver(
   }
 }
 
-// ---------------------------------------------------------------
-// Orchestration
-// ---------------------------------------------------------------
-
 async function runPhase(
   m: Metrics,
   seconds: number,
@@ -384,10 +290,6 @@ async function runPhase(
   await Promise.all(tasks);
 }
 
-// ---------------------------------------------------------------
-// Report
-// ---------------------------------------------------------------
-
 function printReport(m: Metrics, wallSec: number): void {
   const line = '─'.repeat(68);
   const ing = summarizeLatencies(m.ingestLatencies);
@@ -395,8 +297,7 @@ function printReport(m: Metrics, wallSec: number): void {
   const fresh = summarizeLatencies(m.freshnessSamples);
 
   const acceptedPerSec = m.logsAccepted / wallSec;
-  // Rate is measured over the aggregation driver's own window; see the
-  // comment on aggStartMs.
+ 
   const aggWindowSec =
     m.aggEndMs > m.aggStartMs ? (m.aggEndMs - m.aggStartMs) / 1000 : wallSec;
   const aggRateAchieved = m.aggRequests / aggWindowSec;
@@ -473,9 +374,6 @@ function printReport(m: Metrics, wallSec: number): void {
   console.log(line + '\n');
 }
 
-// ---------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------
 
 async function main(): Promise<void> {
   console.log('Mixed workload generator (query while ingesting)');

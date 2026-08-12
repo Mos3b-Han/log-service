@@ -1,33 +1,16 @@
 // loadgen/discover.ts
-//
-// Dataset discovery shared by the read-path generators.
-//
-// Both loadgen/aggregate.ts and loadgen/query.ts need the same thing
-// before they can measure anything meaningful: a time window that
-// actually contains rows, and filter values that actually match at
-// volume. Querying an empty range, or filtering on a service that owns
-// three rows, produces a fast number that proves nothing.
-//
-// Everything here goes through the public HTTP API rather than the
-// database, for the same reason the generators do: they are external
-// clients, exactly like the grader's tool, with no privileged access.
-//
-// This lives in its own module rather than being copied into each
-// generator because the logic is subtle enough to drift -- the
-// "busiest service" rule below replaced a naive "first row's service"
-// version that silently made one query shape meaningless.
+
 
 import { parseJson, timedFetch } from './util.js';
 
 export interface Dataset {
-  /** Upper bound for every query range: the newest row's timestamp. */
+
   readonly end: Date;
-  /** The highest-volume service in the window, for filtered shapes. */
+
   readonly service: string;
-  /** A real attribute key/value pair, for the GIN containment shape. */
+
   readonly attrKey: string | undefined;
   readonly attrValue: string | undefined;
-  /** A word from a real message, for the unindexed substring shape. */
   readonly word: string | undefined;
 }
 
@@ -45,20 +28,7 @@ export function isoOf(end: Date, hoursBack: number): string {
   return new Date(end.getTime() - hoursBack * HOUR_MS).toISOString();
 }
 
-/**
- * Inspect the live dataset and return values the generators can build
- * representative queries from.
- *
- * @param baseUrl        Service root, no trailing slash.
- * @param headers        Auth headers, if any.
- * @param windowHours    How far back the widest query will reach; the
- *                       busiest-service lookup uses the same window so
- *                       the chosen service is busy *there*, not overall.
- * @param untilOverride  Optional ISO upper bound. Set it to aim the
- *                       measurement at a specific slice of history
- *                       instead of whatever the latest ingest left
- *                       behind.
- */
+
 export async function discoverDataset(
   baseUrl: string,
   headers: Record<string, string>,
@@ -106,14 +76,6 @@ export async function discoverDataset(
   };
 }
 
-/**
- * Find the service with the most rows in the measurement window.
- *
- * Taking the service off an arbitrary sample row is a trap: a service
- * owning three rows makes a filtered query return almost nothing, and
- * the resulting single-digit timing says nothing about how the
- * composite index behaves at scale.
- */
 async function busiestService(
   aggUrl: string,
   headers: Record<string, string>,

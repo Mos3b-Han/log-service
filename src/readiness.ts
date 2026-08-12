@@ -1,7 +1,4 @@
-// src/readiness.ts
-//
-// Single source of truth for the application's lifecycle state.
-// Consumed by the health endpoint and the shutdown handler.
+
 
 type AppState = 'starting' | 'ready' | 'shutting_down';
 

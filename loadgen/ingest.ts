@@ -1,43 +1,4 @@
-// loadgen/ingest.ts
-//
-// Ingestion load generator. Drives POST /logs as an external HTTP
-// client -- exactly how the grader's load generator sees the service --
-// and reports achieved throughput, latency percentiles, and the status
-// breakdown that proves whether any request was dropped.
-//
-// Load model: a closed loop of N concurrent workers, each generating a
-// batch, POSTing it, awaiting the response, and repeating. Achieved
-// throughput is therefore whatever the server can absorb -- the client
-// only has to keep enough batches in flight to saturate it. At batch
-// 500 the 15,000 logs/sec target is just ~30 requests/sec, so the
-// bottleneck under test is the server's COPY path, not this client.
-//
-// Configuration (all via environment, all optional):
-//   LOADGEN_URL           base URL              default http://localhost:8080
-//   LOADGEN_BATCH_SIZE    logs per POST         default 500
-//   LOADGEN_CONCURRENCY   parallel workers      default 16
-//   LOADGEN_DURATION_SEC  measured seconds      default 30
-//   LOADGEN_WARMUP_SEC    unrecorded warmup     default 5
-//   LOADGEN_TOTAL_LOGS    if set, run until this many logs are sent
-//                         (count mode, no warmup) instead of by time
-//   LOADGEN_API_KEY       bearer token          default none
-//   LOADGEN_SPREAD_DAYS   spread timestamps over this many days back
-//                         instead of the last 60 seconds. default 0
-//
-// About LOADGEN_SPREAD_DAYS: by default this tool timestamps every
-// entry within the last 60 seconds, which is what a live log stream
-// looks like and is the right shape for measuring peak write
-// throughput. It is the WRONG shape for measuring read latency: all
-// rows land in a single daily partition, so partition pruning has
-// nothing useful to skip and every aggregation scans the whole
-// dataset. Setting LOADGEN_SPREAD_DAYS=30 spreads entries evenly
-// across the last 30 days instead, reproducing the "~1M rows
-// representing about a month" dataset the spec describes.
-//
-// The target partitions must already exist -- run
-// `scripts/seed-history.sh 30` first, since the service only ever
-// provisions partitions forward in time.
-//
+
 // Run: npx tsx loadgen/ingest.ts
 
 import {
@@ -59,9 +20,6 @@ import {
   waitForHealth,
 } from './util.js';
 
-// ---------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------
 
 const URL_BASE = baseUrl();
 const BATCH_SIZE = envInt('LOADGEN_BATCH_SIZE', 500);
@@ -74,9 +32,6 @@ const TOTAL_LOGS = envStr('LOADGEN_TOTAL_LOGS')
 const API_KEY = envStr('LOADGEN_API_KEY');
 const SPREAD_DAYS = envInt('LOADGEN_SPREAD_DAYS', 0, 0);
 
-// How far back entry timestamps may fall. Default is the last 60
-// seconds (live-stream shape); LOADGEN_SPREAD_DAYS widens it to build
-// a historical dataset for read-latency testing.
 const SPREAD_MS = SPREAD_DAYS > 0 ? SPREAD_DAYS * 86_400_000 : 60_000;
 
 const INGEST_URL = `${URL_BASE}/logs`;
@@ -86,9 +41,6 @@ const HEADERS: Record<string, string> = {
   ...authHeaders(),
 };
 
-// ---------------------------------------------------------------
-// Synthetic data
-// ---------------------------------------------------------------
 
 const SERVICES = [
   'checkout', 'auth', 'api', 'payments', 'search',
@@ -110,11 +62,6 @@ interface WireEntry {
   attributes: Record<string, string | number>;
 }
 
-// Build one batch. `nowMs` is computed once per batch by the caller.
-// Timestamps are jittered backwards across SPREAD_MS (60s by default,
-// or LOADGEN_SPREAD_DAYS worth of history when set), so every value is
-// in the past and therefore always passes the "not more than 5 minutes
-// in the future" validation rule.
 function makeBatchBody(nowMs: number): string {
   const logs: WireEntry[] = new Array(BATCH_SIZE);
   for (let i = 0; i < BATCH_SIZE; i++) {
@@ -134,9 +81,6 @@ function makeBatchBody(nowMs: number): string {
   return JSON.stringify({ logs });
 }
 
-// ---------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------
 
 interface Metrics {
   requests: number;
@@ -147,11 +91,7 @@ interface Metrics {
   logsSent: number;
   logsAccepted: number;
   bytesSent: number;
-  latencies: number[]; // ms, per request that produced a response
-  // Requests that failed before a response arrived, and therefore
-  // contributed no latency sample. Tracked separately so the report can
-  // say so out loud: percentiles computed over survivors alone look
-  // better than reality precisely when a server is struggling.
+  latencies: number[]; 
   networkFailures: number;
   firstErrorSamples: string[];
 }
@@ -164,15 +104,10 @@ function newMetrics(): Metrics {
   };
 }
 
-// ---------------------------------------------------------------
-// Worker + phase runner
-// ---------------------------------------------------------------
 
 interface PhaseOpts {
   readonly label: string;
   readonly record: boolean;
-  // Stop when this returns true. Evaluated at the top of each worker
-  // iteration.
   readonly done: () => boolean;
 }
 
@@ -195,8 +130,7 @@ async function runWorker(m: Metrics, opts: PhaseOpts): Promise<void> {
     m.bytesSent += bytes;
 
     if (!res.ok) {
-      // Never reached the server: counted as failed, but deliberately
-      // kept out of the latency distribution.
+      
       m.failed++;
       m.networkFailures++;
       if (m.firstErrorSamples.length < 5) {
@@ -233,9 +167,6 @@ async function runPhase(opts: PhaseOpts): Promise<Metrics> {
   return m;
 }
 
-// ---------------------------------------------------------------
-// Progress printer
-// ---------------------------------------------------------------
 
 function startProgress(m: Metrics, startMs: number): NodeJS.Timeout {
   let lastAccepted = 0;
@@ -258,10 +189,6 @@ function startProgress(m: Metrics, startMs: number): NodeJS.Timeout {
   timer.unref();
   return timer;
 }
-
-// ---------------------------------------------------------------
-// Report
-// ---------------------------------------------------------------
 
 function printReport(m: Metrics, wallSec: number): void {
   const acceptedPerSec = m.logsAccepted / wallSec;
@@ -317,9 +244,6 @@ function printReport(m: Metrics, wallSec: number): void {
   console.log(line + '\n');
 }
 
-// ---------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------
 
 async function main(): Promise<void> {
   console.log('Ingest load generator');
@@ -330,9 +254,6 @@ async function main(): Promise<void> {
 
   await waitForHealth(URL_BASE);
 
-  // Warmup (duration mode only): send real traffic without recording,
-  // so JIT, connection pools, and the server's write buffers are all
-  // warm before we start the clock.
   if (TOTAL_LOGS === undefined && WARMUP_SEC > 0) {
     console.log(`\nWarmup ${WARMUP_SEC}s (not recorded)...`);
     const warmEnd = Date.now() + WARMUP_SEC * 1000;
@@ -346,8 +267,6 @@ async function main(): Promise<void> {
   console.log('\nMeasuring...');
   const startMs = Date.now();
 
-  // Placeholder metrics object for the progress printer; the real one
-  // is created inside runPhase, so we thread progress via a shared ref.
   const shared = newMetrics();
   const progress = startProgress(shared, startMs);
 
@@ -357,8 +276,6 @@ async function main(): Promise<void> {
       ? () => Date.now() >= measuredEnd
       : () => shared.logsSent >= TOTAL_LOGS;
 
-  // Run workers directly against `shared` so the progress printer sees
-  // live counts.
   const workers: Promise<void>[] = [];
   for (let i = 0; i < CONCURRENCY; i++) {
     workers.push(runWorker(shared, { label: 'measure', record: true, done }));

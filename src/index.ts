@@ -49,11 +49,7 @@ async function main() {
   // partitions) runs in the same cycle but is best-effort.
   await runPartitionMaintenance();
 
-  // Step 4: wire up HTTP layer. Auth is registered before the routes
-  // so its onRequest hook (when enabled) guards every data endpoint;
-  // when disabled it installs nothing and /health stays exempt either
-  // way. Seeding happens here, before listen, so a valid credential
-  // exists the moment the service reports ready.
+
   registerErrorHandler(server);
   registerAuth(server);
   await registerHealthRoute(server);
@@ -61,17 +57,13 @@ async function main() {
   await registerQueryRoute(server);
   await registerAggregateRoute(server);
 
-  // Step 5: start listening on all interfaces (required for Docker).
   await server.listen({ port: config.port, host: '0.0.0.0' });
   console.log(`log-service listening on port ${config.port}`);
 
-  // Step 6: only now is the service truly ready.
   setReady();
   console.log('Service is ready.');
 
-  // Step 7: start the background partition maintenance cycle. The timer
-  // is unref'd, so it never keeps the process alive on its own; the
-  // shutdown handler stops it explicitly.
+ 
   startPartitionMaintenance();
 }
 

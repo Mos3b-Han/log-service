@@ -1,6 +1,5 @@
 -- 001_schema.sql
 -- Parent table for the logs partition tree.
--- Decisions documented in README.md.
 
 CREATE TABLE logs (
     id          BIGSERIAL,

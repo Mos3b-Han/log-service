@@ -1,44 +1,4 @@
-// loadgen/query.ts
-//
-// Query load generator for GET /logs. Produces the "query rate" and
-// "query latency percentiles" the README is required to report, and --
-// more importantly -- tests the one claim this project's pagination
-// design stands or falls on.
-//
-// ---- Two phases, because one number would not prove the design ----
-//
-// PHASE 1: query shapes. Cycles through a representative set (no
-// filter, indexed equality filters, JSONB containment, the deliberately
-// unindexed message substring) and reports percentiles per shape, so a
-// slow access path is visible instead of averaged away.
-//
-// PHASE 2: deep pagination walk. Starts at page 1 and follows
-// next_cursor for N pages, recording latency at each depth.
-//
-// Phase 2 exists to test the central claim behind keyset pagination
-// (OFFSET is banned anywhere in this project): page 1000 costs the same as
-// page 1. OFFSET degrades linearly -- the database must read and
-// discard every skipped row, so page 1000 at limit 100 reads 99,900
-// rows before returning anything. A seek predicate on (timestamp, id)
-// jumps straight to its position in the index regardless of depth.
-//
-// That is a testable prediction, not an opinion, so this phase tests
-// it: if latency at depth is flat, the design is vindicated with
-// evidence; if it climbs, something is wrong and the write-up needs to
-// say so. Reporting shallow-vs-deep side by side makes either outcome
-// impossible to hide.
-//
-// Configuration (all optional):
-//   LOADGEN_URL           base URL                  default http://localhost:8080
-//   LOADGEN_QUERY_RATE    shape queries per second  default 5
-//   LOADGEN_DURATION_SEC  phase 1 seconds           default 60
-//   LOADGEN_WARMUP_SEC    unrecorded warmup         default 5
-//   LOADGEN_LIMIT         page size, 1..1000        default 100
-//   LOADGEN_PAGES         phase 2 pages to walk     default 200
-//   LOADGEN_WINDOW_HOURS  span of the widest query  default 24
-//   LOADGEN_UNTIL         ISO upper bound           default newest row
-//   LOADGEN_API_KEY       bearer token              default none
-//
+
 // Run: npx tsx loadgen/query.ts
 
 import {
@@ -61,10 +21,6 @@ import {
   waitForHealth,
 } from './util.js';
 
-// ---------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------
-
 const URL_BASE = baseUrl();
 const QUERY_RATE = envNum('LOADGEN_QUERY_RATE', 5);
 const DURATION_SEC = envInt('LOADGEN_DURATION_SEC', 60);
@@ -79,9 +35,6 @@ const LOGS_URL = `${URL_BASE}/logs`;
 
 const HEADERS: Record<string, string> = authHeaders();
 
-// ---------------------------------------------------------------
-// Query shapes (phase 1)
-// ---------------------------------------------------------------
 
 interface QueryShape {
   readonly name: string;
@@ -137,8 +90,7 @@ function buildShapes(ds: Dataset): QueryShape[] {
     });
   }
 
-  // Deliberately unindexed by design. Expected to be the slowest;
-  // measuring it is the point, since the README must own that tradeoff.
+  
   if (ds.word !== undefined) {
     add('q= substring', 'UNINDEXED message ILIKE scan', { q: ds.word });
   }
@@ -151,9 +103,6 @@ function buildShapes(ds: Dataset): QueryShape[] {
   return shapes;
 }
 
-// ---------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------
 
 interface ShapeMetrics {
   readonly shape: QueryShape;
@@ -161,8 +110,7 @@ interface ShapeMetrics {
   ok: number;
   failed: number;
   rowsReturned: number;
-  // See aggregate.ts: network-level failures carry no latency sample and
-  // are surfaced rather than silently dropped from the distribution.
+  
   networkFailures: number;
   errorSample: string | undefined;
 }
@@ -185,9 +133,6 @@ interface PageSample {
   readonly rows: number;
 }
 
-// ---------------------------------------------------------------
-// Phase 1: shape latency
-// ---------------------------------------------------------------
 
 async function runShape(m: ShapeMetrics, record: boolean): Promise<void> {
   const res = await timedFetch(`${LOGS_URL}?${m.shape.query}`, {
@@ -212,11 +157,6 @@ async function runShape(m: ShapeMetrics, record: boolean): Promise<void> {
   }
 }
 
-/**
- * Paced on an absolute schedule so a slow response cannot silently
- * lower the offered rate (coordinated omission). Shapes are visited
- * round-robin so each accumulates an equal sample count.
- */
 async function runShapePhase(
   metrics: ShapeMetrics[],
   seconds: number,
@@ -236,17 +176,6 @@ async function runShapePhase(
   return (Date.now() - start) / 1000;
 }
 
-// ---------------------------------------------------------------
-// Phase 2: deep pagination walk
-// ---------------------------------------------------------------
-
-/**
- * Follow next_cursor from page 1 to page N, timing each request.
- *
- * Returns one sample per page. The caller compares the shallow pages
- * against the deep ones -- with keyset pagination the two should be
- * indistinguishable, whereas OFFSET would show a clear upward slope.
- */
 async function paginationWalk(): Promise<PageSample[]> {
   const samples: PageSample[] = [];
   let cursor: string | null = null;
@@ -277,9 +206,6 @@ async function paginationWalk(): Promise<PageSample[]> {
   return samples;
 }
 
-// ---------------------------------------------------------------
-// Report
-// ---------------------------------------------------------------
 
 function printReport(
   metrics: ShapeMetrics[],
@@ -371,9 +297,6 @@ function printReport(
     );
     console.log('');
 
-    // The verdict: with a seek predicate, depth should not matter.
-    // OFFSET at this depth would read `depth * LIMIT` rows for the last
-    // page alone, so any real degradation would be unmistakable.
     const ratio = headStats.p50 > 0 ? tailStats.p50 / headStats.p50 : NaN;
     const rowsSkippedByOffset = depth * LIMIT;
     console.log(`    deepest page starts at row ~${fmtInt(rowsSkippedByOffset)};`);
@@ -395,9 +318,6 @@ function printReport(
   console.log(line + '\n');
 }
 
-// ---------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------
 
 async function main(): Promise<void> {
   console.log('Query load generator (GET /logs)');

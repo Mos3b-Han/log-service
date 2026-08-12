@@ -1,14 +1,5 @@
 // loadgen/report.ts
-//
-// Shared statistics and formatting for the load generators. Kept free
-// of any HTTP or scenario logic so ingest.ts, query.ts, aggregate.ts,
-// and mixed.ts all report numbers the same way. Pure functions only.
-//
-// These tools produce the measured numbers that go into PERFORMANCE.md,
-// so the percentile math is deliberately simple and inspectable: sort
-// the samples, index by rank. No sketches or approximations -- request
-// counts here are small enough (thousands to low millions) to hold and
-// sort exactly.
+
 
 export interface LatencySummary {
   readonly count: number;
@@ -21,10 +12,6 @@ export interface LatencySummary {
   readonly max: number;
 }
 
-/**
- * Nearest-rank percentile on an ascending-sorted array. `p` is 0..100.
- * Returns NaN for an empty array.
- */
 export function percentile(sortedAsc: readonly number[], p: number): number {
   const n = sortedAsc.length;
   if (n === 0) return NaN;
@@ -33,10 +20,6 @@ export function percentile(sortedAsc: readonly number[], p: number): number {
   return sortedAsc[idx]!;
 }
 
-/**
- * Summarize a set of latency samples (milliseconds). Copies and sorts
- * the input, so the caller's array is left untouched.
- */
 export function summarizeLatencies(samplesMs: readonly number[]): LatencySummary {
   const n = samplesMs.length;
   if (n === 0) {
@@ -66,16 +49,10 @@ export function summarizeLatencies(samplesMs: readonly number[]): LatencySummary
   };
 }
 
-// ---------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------
-
-/** Integer with thousands separators, e.g. 1234567 -> "1,234,567". */
 export function fmtInt(n: number): string {
   return Math.round(n).toLocaleString('en-US');
 }
 
-/** Fixed-decimal number, default 2 places. */
 export function fmtNum(n: number, decimals = 2): string {
   if (!Number.isFinite(n)) return 'n/a';
   return n.toLocaleString('en-US', {
@@ -84,7 +61,6 @@ export function fmtNum(n: number, decimals = 2): string {
   });
 }
 
-/** Milliseconds with a unit, e.g. "12.34 ms". */
 export function fmtMs(n: number): string {
   return Number.isFinite(n) ? `${fmtNum(n)} ms` : 'n/a';
 }
@@ -101,19 +77,6 @@ export function fmtBytes(bytes: number): string {
   return `${fmtNum(v)} ${units[u]}`;
 }
 
-/**
- * Render a latency summary as aligned lines for the final report.
- *
- * `excluded` is the number of requests that produced no latency sample
- * because they failed at the network level, before a response arrived.
- * Folding those into the distribution would flatter it -- a refused
- * connection returns in a fraction of a millisecond -- but dropping
- * them silently is worse: the percentiles would then describe only the
- * requests that survived, which is exactly the wrong bias when a server
- * is collapsing. When any were excluded the count is printed alongside
- * the samples, so the reader can never mistake a survivors-only
- * distribution for the whole picture.
- */
 export function formatLatencyBlock(s: LatencySummary, excluded = 0): string {
   const samples =
     excluded > 0

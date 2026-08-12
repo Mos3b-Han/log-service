@@ -1,19 +1,3 @@
--- 004_retention.sql
--- Partition metadata view for the logs partitioned table.
---
--- The retention orchestration itself (deciding when to drop, running
--- the schedule, emitting metrics, handling failures) lives in the
--- Node.js application layer. This file provides only a read-only
--- helper view that surfaces each partition's name and its inclusive
--- lower bound and exclusive upper bound as proper timestamptz values.
---
--- Consumers of this view:
---   - retention job: SELECT partition_name FROM logs_partitions
---                    WHERE upper_bound <= $cutoff
---   - future-partition creator: same view to detect gaps ahead
---   - monitoring: expose current partition coverage as a metric
---
--- Design rationale documented in README.md (Retention strategy).
 
 CREATE OR REPLACE VIEW logs_partitions AS
 SELECT

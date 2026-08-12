@@ -1,17 +1,4 @@
-// src/config.ts
-//
-// The single place in this codebase allowed to read `process.env`.
-// Every other module receives configuration through the exported
-// `config` object below — never through `process.env` directly.
-//
-// Behavior:
-//   - Missing variable  -> use the documented default (zero-config
-//                          startup, per the grading spec's contract)
-//   - Present + valid   -> use the provided value
-//   - Present + malformed -> throw immediately at import time.
-//     A crash at startup, before any traffic is accepted, is far
-//     cheaper than a crash after the load generator has already
-//     begun sending 15,000 logs/sec.
+
 
 interface Config {
     readonly port: number;
