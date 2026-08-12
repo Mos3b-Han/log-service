@@ -5,7 +5,7 @@
 // and computes the opaque next_cursor. All SQL lives here and in
 // filters.ts; the route (query.ts) stays free of database concerns.
 //
-// Pagination strategy: keyset seek, never OFFSET (CLAUDE.md §11). We
+// Pagination strategy: keyset seek, never OFFSET. We
 // ask Postgres for LIMIT+1 rows. If it returns the extra row, there is
 // another page: we drop the extra, return exactly `limit` rows, and
 // encode a cursor from the last RETURNED row so the next request seeks

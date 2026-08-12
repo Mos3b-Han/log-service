@@ -44,7 +44,7 @@ const MAX_ATTR_FILTERS = 32;
 // parameter (never concatenated into SQL), we still constrain its
 // shape as defense in depth and to reject obvious garbage early. This
 // is the "validate dynamic identifiers against a regex allow-list"
-// rule from CLAUDE.md §10/§11, applied at the earliest possible point.
+// rule described in README.md, applied at the earliest possible point.
 const ATTR_KEY_RE = /^[A-Za-z0-9_.\-]{1,128}$/;
 
 const ATTR_PREFIX = 'attr.';

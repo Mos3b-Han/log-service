@@ -2,7 +2,7 @@
 //
 // Partition lifecycle management, run in the Node.js layer rather than
 // PL/pgSQL so it is testable, observable, and stoppable on shutdown
-// (CLAUDE.md §4). One maintenance cycle does two things, in this order:
+// One maintenance cycle does two things, in this order:
 //
 //   1. Provisioning -- ensure a daily partition exists for every day in
 //      [today, today + PARTITION_LOOKAHEAD_DAYS]. Missing future
@@ -12,7 +12,7 @@
 //   2. Retention -- DROP partitions whose entire range is older than
 //      RETENTION_DAYS. DROP is an O(1) metadata operation with no dead
 //      tuples, no bloat, and one WAL record -- never DELETE (see
-//      DESIGN.md). Delayed retention only means data outlives its
+//      README.md). Delayed retention only means data outlives its
 //      policy briefly, so a failure here is logged, not fatal.
 //
 // Partition metadata is read from the logs_partitions view

@@ -13,7 +13,7 @@
 // actually slow. This generator cycles through a representative set --
 // fine and coarse buckets, grouped and ungrouped, indexed filters
 // (service, attributes) and the deliberately unindexed one (message
-// substring, see CLAUDE.md §9) -- and reports percentiles per shape as
+// substring, deliberately unindexed) -- and reports percentiles per shape as
 // well as overall. The headline verdict uses the WORST shape's p95, so
 // the claim "aggregation p95 is under 1s" holds for every shape, not
 // just a favorable one.
@@ -164,7 +164,7 @@ function buildShapes(ds: Dataset): QueryShape[] {
     });
   }
 
-  // Message substring -- deliberately unindexed (CLAUDE.md §9). Expected
+  // Message substring -- deliberately unindexed by design. Expected
   // to be the slowest shape; measuring it is the point, since the README
   // has to own this limitation honestly.
   if (ds.word !== undefined) {

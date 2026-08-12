@@ -9,13 +9,13 @@
 //      { accepted, rejected } or 400 if nothing was accepted).
 //
 //   2. Computing `Date.now()` exactly once per batch, before the entry
-//      loop. Per CLAUDE.md §11, calling Date.now() inside a 5,000-entry
+//      loop. Calling Date.now() inside a 5,000-entry
 //      loop is a documented anti-pattern; validateEntry accepts `now`
 //      as a parameter for precisely this reason.
 //
 // This file performs no I/O, imports nothing from http/ or db/, and
 // never throws on invalid input -- consistent with the core layer's
-// contract in CLAUDE.md §4.
+// contract described in README.md.
 
 import { validateEntry } from './validateEntry.js';
 import {
@@ -24,7 +24,7 @@ import {
   type RejectedEntry,
 } from '../types.js';
 
-// From CLAUDE.md §8. Enforced pre-loop, so an abusive 1M-entry batch
+// Documented batch limit. Enforced pre-loop, so an abusive 1M-entry batch
 // is rejected before we allocate a validator result for each one.
 const MAX_BATCH_SIZE = 5_000;
 
@@ -102,7 +102,7 @@ export function validateBatch(
   }
 
   // Compute wall time ONCE per batch. Every validateEntry call reuses
-  // this value. CLAUDE.md §11 lists Date.now() inside a per-entry loop
+  // this value. Date.now() inside a per-entry loop is
   // as an explicit anti-pattern; the cost is small per call but the
   // discipline is what keeps hot paths honest.
   const now = Date.now();

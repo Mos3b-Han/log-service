@@ -13,7 +13,7 @@
 --   - future-partition creator: same view to detect gaps ahead
 --   - monitoring: expose current partition coverage as a metric
 --
--- Design rationale documented in DESIGN.md.
+-- Design rationale documented in README.md (Retention strategy).
 
 CREATE OR REPLACE VIEW logs_partitions AS
 SELECT

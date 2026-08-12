@@ -3,7 +3,7 @@
 // Encode and decode the opaque pagination cursor for GET /logs. The
 // cursor carries the (timestamp, id) of the last row on a page so the
 // next request can seek past it -- keyset pagination, never OFFSET
-// (CLAUDE.md §11). Pure core logic: no I/O, no imports from http/ or
+// by design. Pure core logic: no I/O, no imports from http/ or
 // db/, and decode never throws -- it returns a ValidationResult so a
 // tampered or stale cursor becomes a clean 400 (§8).
 //

@@ -16,7 +16,7 @@
 // next_cursor for N pages, recording latency at each depth.
 //
 // Phase 2 exists to test the central claim behind keyset pagination
-// (CLAUDE.md §11 forbids OFFSET anywhere): page 1000 costs the same as
+// (OFFSET is banned anywhere in this project): page 1000 costs the same as
 // page 1. OFFSET degrades linearly -- the database must read and
 // discard every skipped row, so page 1000 at limit 100 reads 99,900
 // rows before returning anything. A seek predicate on (timestamp, id)
@@ -137,7 +137,7 @@ function buildShapes(ds: Dataset): QueryShape[] {
     });
   }
 
-  // Deliberately unindexed (CLAUDE.md §9). Expected to be the slowest;
+  // Deliberately unindexed by design. Expected to be the slowest;
   // measuring it is the point, since the README must own that tradeoff.
   if (ds.word !== undefined) {
     add('q= substring', 'UNINDEXED message ILIKE scan', { q: ds.word });

@@ -1,6 +1,6 @@
 -- 002_indexes.sql
 -- Secondary indexes on the logs parent table.
--- Rationale documented in DESIGN.md.
+-- Rationale documented in README.md (Index design).
 -- These indexes are inherited by every partition created later.
 
 -- Composite index for the primary query pattern:

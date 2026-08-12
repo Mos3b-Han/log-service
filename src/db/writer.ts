@@ -11,7 +11,7 @@
 // §7 of the spec:  "Never respond 200 to a batch you have not
 // durably accepted."
 //
-// §10 of CLAUDE.md: "Buffer flushes on size (500 rows) or time
+// The design brief: "Buffer flushes on size (500 rows) or time
 // (200ms). Buffer full -> return 429 with Retry-After."
 //
 // These two rules pull in opposite directions. If we buffer to batch

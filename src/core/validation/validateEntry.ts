@@ -10,7 +10,7 @@
 // is O(1) except the attribute loop, which is O(k) where k is the
 // entry's attribute count (bounded to MAX_ATTRIBUTE_COUNT below).
 //
-// Design constraints imposed by CLAUDE.md §11:
+// Design constraints on this hot path:
 //   - No `throw` per invalid entry (return a result object).
 //   - No `new Date(x)` as the sole validation (regex + parse + NaN).
 //   - No `Date.now()` inside the loop (caller supplies `now`).
@@ -161,7 +161,7 @@ function validateAttributes(
  *              untyped, potentially malicious.
  * @param now   Current wall time in milliseconds. MUST be computed
  *              once by the caller before entering its batch loop;
- *              CLAUDE.md §11 forbids Date.now() inside the loop.
+ *              Date.now() inside the loop is a documented anti-pattern.
  * @param minTimestampMs
  *              Earliest instant we can actually store: the start of the
  *              oldest retained UTC day. Entries older than this have no

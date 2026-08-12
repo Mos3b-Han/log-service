@@ -43,4 +43,4 @@
 --   reader will look for it.
 --
 -- Partition creation now lives entirely in the application layer; see
--- src/db/retention.ts and the retention section of DESIGN.md.
+-- src/db/retention.ts and the retention section of README.md.

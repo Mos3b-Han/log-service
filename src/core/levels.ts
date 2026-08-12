@@ -2,7 +2,7 @@
 //
 // Encoding and decoding between the wire representation of a log
 // level ('debug' | 'info' | 'warn' | 'error') and its storage
-// representation (SMALLINT 0..3). Per DESIGN.md §9, this mapping
+// representation (SMALLINT 0..3). Per README.md (Schema design), this mapping
 // lives strictly in the core layer -- routes and SQL touch the
 // numeric form only, so they never need to know the string names.
 //

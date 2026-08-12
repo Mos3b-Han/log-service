@@ -151,7 +151,7 @@ export function filterConditions(
  * Build the keyset-pagination condition that seeks past the last row
  * of the previous page. Uses a row-value comparison on (timestamp, id)
  * so it aligns exactly with `ORDER BY "timestamp" DESC, id DESC` and
- * the primary key (timestamp, id). Never OFFSET (CLAUDE.md §11).
+ * the primary key (timestamp, id). Never OFFSET.
  *
  * `< (ts, id)` selects rows strictly "older" than the cursor under the
  * descending order, giving stable, gap-free pagination even as new

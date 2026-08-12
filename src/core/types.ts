@@ -73,7 +73,7 @@ export interface LogEntry {
 // ---------------------------------------------------------------
 
 // A tagged-union result type for validation. Preferred over throwing
-// per the CLAUDE.md anti-patterns list: throwing on every bad entry
+// deliberately, not by accident: throwing on every bad entry
 // in a 5,000-entry batch is expensive and awkward to accumulate.
 // The `ok` discriminant lets callers narrow with a single `if`.
 export type ValidationResult<T> =
