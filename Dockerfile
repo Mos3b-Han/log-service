@@ -17,7 +17,7 @@
     RUN npm ci
     
     # Now copy source and config needed to compile.
-    COPY tsconfig.json ./
+    COPY tsconfig.json tsconfig.build.json ./
     COPY src ./src
     
     RUN npm run build

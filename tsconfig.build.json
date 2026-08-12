@@ -1,0 +1,19 @@
+{
+  // Build configuration: compiles src/ to dist/ and nothing else.
+  //
+  // Inherits every strictness setting from tsconfig.json, then narrows
+  // the input and turns emit back on. Tests and load generators are
+  // deliberately outside this: they are development tooling and have no
+  // place in the runtime image, which ships only dist/ plus production
+  // dependencies.
+  //
+  // Used by `npm run build`, which is what the Dockerfile invokes.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "noEmitOnError": true
+  },
+  "include": ["src/**/*.ts"]
+}

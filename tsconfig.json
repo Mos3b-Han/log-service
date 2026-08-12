@@ -1,11 +1,24 @@
 {
+  // Editor and typecheck configuration: covers EVERY TypeScript file in
+  // the repository, and emits nothing.
+  //
+  // Compilation to dist/ is a separate concern handled by
+  // tsconfig.build.json, which narrows the input to src/ and sets
+  // rootDir/outDir. Splitting them fixes two problems that a single
+  // src-only config caused:
+  //
+  //   1. Files under loadgen/ and tests/ were covered by no config at
+  //      all, so the editor fell back to default compiler options --
+  //      no lib, no @types/node -- and reported phantom errors on
+  //      `process.env` and on iterating a Map.
+  //   2. `npm run typecheck` silently skipped both directories, so a
+  //      genuine type error in the test suite or the load generators
+  //      would not have been caught by CI.
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "rootDir": "src",
-    "outDir": "dist",
 
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -20,8 +33,13 @@
 
     "sourceMap": true,
     "declaration": false,
-    "noEmitOnError": true
+    "noEmit": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "tests", "loadgen"]
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "loadgen/**/*.ts",
+    "vitest.config.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
 }
