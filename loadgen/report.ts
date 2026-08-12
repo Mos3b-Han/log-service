@@ -103,10 +103,24 @@ export function fmtBytes(bytes: number): string {
 
 /**
  * Render a latency summary as aligned lines for the final report.
+ *
+ * `excluded` is the number of requests that produced no latency sample
+ * because they failed at the network level, before a response arrived.
+ * Folding those into the distribution would flatter it -- a refused
+ * connection returns in a fraction of a millisecond -- but dropping
+ * them silently is worse: the percentiles would then describe only the
+ * requests that survived, which is exactly the wrong bias when a server
+ * is collapsing. When any were excluded the count is printed alongside
+ * the samples, so the reader can never mistake a survivors-only
+ * distribution for the whole picture.
  */
-export function formatLatencyBlock(s: LatencySummary): string {
+export function formatLatencyBlock(s: LatencySummary, excluded = 0): string {
+  const samples =
+    excluded > 0
+      ? `  samples : ${fmtInt(s.count)}  (${fmtInt(excluded)} excluded: network failures)`
+      : `  samples : ${fmtInt(s.count)}`;
   return [
-    `  samples : ${fmtInt(s.count)}`,
+    samples,
     `  min     : ${fmtMs(s.min)}`,
     `  mean    : ${fmtMs(s.mean)}`,
     `  p50     : ${fmtMs(s.p50)}`,

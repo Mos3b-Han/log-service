@@ -61,47 +61,37 @@ import {
   type LatencySummary,
 } from './report.js';
 import { discoverDataset, isoOf, type Dataset } from './discover.js';
+import {
+  authHeaders,
+  baseUrl,
+  envInt,
+  envNum,
+  envStr,
+  parseJson,
+  sleep,
+  timedFetch,
+  waitForHealth,
+} from './util.js';
 
 // ---------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------
 
-function envInt(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return dflt;
-  const n = Number.parseInt(raw, 10);
-  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
-  return n;
-}
-
-function envNum(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return dflt;
-  const n = Number.parseFloat(raw);
-  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
-  return n;
-}
-
-const URL_BASE = (process.env['LOADGEN_URL'] ?? 'http://localhost:8080').replace(
-  /\/$/,
-  '',
-);
+const URL_BASE = baseUrl();
 const RATE_PER_SEC = envNum('LOADGEN_AGG_RATE', 1);
 const DURATION_SEC = envInt('LOADGEN_DURATION_SEC', 60);
-const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5);
+const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5, 0);
 const WINDOW_HOURS = envInt('LOADGEN_WINDOW_HOURS', 24);
-const API_KEY = process.env['LOADGEN_API_KEY'];
-const UNTIL_OVERRIDE = process.env['LOADGEN_UNTIL'];
+const API_KEY = envStr('LOADGEN_API_KEY');
+const UNTIL_OVERRIDE = envStr('LOADGEN_UNTIL');
 
 const AGG_URL = `${URL_BASE}/logs/aggregate`;
 const LOGS_URL = `${URL_BASE}/logs`;
-const HEALTH_URL = `${URL_BASE}/health`;
 
 // The spec's hard target for this endpoint.
 const P95_TARGET_MS = 1000;
 
-const HEADERS: Record<string, string> = {};
-if (API_KEY) HEADERS['authorization'] = `Bearer ${API_KEY}`;
+const HEADERS: Record<string, string> = authHeaders();
 
 // ---------------------------------------------------------------
 // Query shapes
@@ -199,6 +189,10 @@ interface ShapeMetrics {
   badRequest: number;
   failed: number;
   bucketsReturned: number;
+  // Requests that never reached the server, and so produced no latency
+  // sample. Reported explicitly so survivors-only percentiles cannot
+  // masquerade as the full distribution.
+  networkFailures: number;
   errorSample: string | undefined;
 }
 
@@ -210,6 +204,7 @@ function newShapeMetrics(shape: QueryShape): ShapeMetrics {
     badRequest: 0,
     failed: 0,
     bucketsReturned: 0,
+    networkFailures: 0,
     errorSample: undefined,
   };
 }
@@ -218,42 +213,32 @@ function newShapeMetrics(shape: QueryShape): ShapeMetrics {
  * Issue one aggregation request and record the outcome.
  */
 async function runOne(m: ShapeMetrics, record: boolean): Promise<void> {
-  const t0 = performance.now();
-  try {
-    const res = await fetch(`${AGG_URL}?${m.shape.query}`, { headers: HEADERS });
-    const elapsed = performance.now() - t0;
+  const res = await timedFetch(`${AGG_URL}?${m.shape.query}`, {
+    headers: HEADERS,
+  });
+  if (!record) return;
 
-    if (res.status === 200) {
-      const body = (await res.json()) as { buckets: unknown[] };
-      if (record) {
-        m.ok++;
-        m.bucketsReturned += body.buckets.length;
-        m.latencies.push(elapsed);
-      }
-    } else {
-      const text = await res.text();
-      if (record) {
-        if (res.status === 400) m.badRequest++;
-        else m.failed++;
-        m.latencies.push(elapsed);
-        m.errorSample ??= `HTTP ${res.status}: ${text.slice(0, 140)}`;
-      }
-    }
-  } catch (err) {
-    if (record) {
-      m.failed++;
-      m.errorSample ??= `network: ${(err as Error).message}`;
-    }
+  if (!res.ok) {
+    m.failed++;
+    m.networkFailures++;
+    m.errorSample ??= `network: ${res.error}`;
+    return;
+  }
+
+  m.latencies.push(res.elapsedMs);
+  if (res.status === 200) {
+    m.ok++;
+    m.bucketsReturned += parseJson<{ buckets: unknown[] }>(res)?.buckets.length ?? 0;
+  } else {
+    if (res.status === 400) m.badRequest++;
+    else m.failed++;
+    m.errorSample ??= `HTTP ${res.status}: ${res.text.slice(0, 140)}`;
   }
 }
 
 // ---------------------------------------------------------------
 // Paced runner
 // ---------------------------------------------------------------
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 /**
  * Run for `durationSec`, issuing one request every `1/RATE_PER_SEC`
@@ -293,29 +278,6 @@ async function runPhase(
 }
 
 // ---------------------------------------------------------------
-// Health gate
-// ---------------------------------------------------------------
-
-async function waitForHealth(): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  process.stdout.write(`Waiting for ${HEALTH_URL} ... `);
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(HEALTH_URL);
-      if (res.status === 200) {
-        await res.text();
-        process.stdout.write('ready.\n');
-        return;
-      }
-    } catch {
-      // not up yet
-    }
-    await sleep(500);
-  }
-  throw new Error(`Service did not become healthy at ${HEALTH_URL}`);
-}
-
-// ---------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------
 
@@ -334,6 +296,7 @@ function printReport(
     0,
   );
   const totalErrors = metrics.reduce((n, m) => n + m.badRequest + m.failed, 0);
+  const totalNetworkFailures = metrics.reduce((n, m) => n + m.networkFailures, 0);
 
   console.log(`\n${line}`);
   console.log('  AGGREGATION LATENCY REPORT');
@@ -375,7 +338,7 @@ function printReport(
   }
   console.log('');
   console.log('  Overall latency (all shapes pooled)');
-  console.log(formatLatencyBlock(overall));
+  console.log(formatLatencyBlock(overall, totalNetworkFailures));
   console.log('');
 
   // The verdict uses the WORST shape, so the claim holds universally.
@@ -425,7 +388,7 @@ async function main(): Promise<void> {
       `window=${WINDOW_HOURS}h warmup=${WARMUP_SEC}s`,
   );
 
-  await waitForHealth();
+  await waitForHealth(URL_BASE);
 
   process.stdout.write('Discovering dataset window ... ');
   const ds = await discoverDataset(

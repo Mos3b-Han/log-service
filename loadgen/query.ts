@@ -49,45 +49,35 @@ import {
   fmtMs,
 } from './report.js';
 import { discoverDataset, isoOf, type Dataset } from './discover.js';
+import {
+  authHeaders,
+  baseUrl,
+  envInt,
+  envNum,
+  envStr,
+  parseJson,
+  sleep,
+  timedFetch,
+  waitForHealth,
+} from './util.js';
 
 // ---------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------
 
-function envInt(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return dflt;
-  const n = Number.parseInt(raw, 10);
-  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
-  return n;
-}
-
-function envNum(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return dflt;
-  const n = Number.parseFloat(raw);
-  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
-  return n;
-}
-
-const URL_BASE = (process.env['LOADGEN_URL'] ?? 'http://localhost:8080').replace(
-  /\/$/,
-  '',
-);
+const URL_BASE = baseUrl();
 const QUERY_RATE = envNum('LOADGEN_QUERY_RATE', 5);
 const DURATION_SEC = envInt('LOADGEN_DURATION_SEC', 60);
-const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5);
+const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5, 0);
 const LIMIT = envInt('LOADGEN_LIMIT', 100);
 const PAGES = envInt('LOADGEN_PAGES', 200);
 const WINDOW_HOURS = envInt('LOADGEN_WINDOW_HOURS', 24);
-const UNTIL_OVERRIDE = process.env['LOADGEN_UNTIL'];
-const API_KEY = process.env['LOADGEN_API_KEY'];
+const UNTIL_OVERRIDE = envStr('LOADGEN_UNTIL');
+const API_KEY = envStr('LOADGEN_API_KEY');
 
 const LOGS_URL = `${URL_BASE}/logs`;
-const HEALTH_URL = `${URL_BASE}/health`;
 
-const HEADERS: Record<string, string> = {};
-if (API_KEY) HEADERS['authorization'] = `Bearer ${API_KEY}`;
+const HEADERS: Record<string, string> = authHeaders();
 
 // ---------------------------------------------------------------
 // Query shapes (phase 1)
@@ -171,11 +161,22 @@ interface ShapeMetrics {
   ok: number;
   failed: number;
   rowsReturned: number;
+  // See aggregate.ts: network-level failures carry no latency sample and
+  // are surfaced rather than silently dropped from the distribution.
+  networkFailures: number;
   errorSample: string | undefined;
 }
 
 function newShapeMetrics(shape: QueryShape): ShapeMetrics {
-  return { shape, latencies: [], ok: 0, failed: 0, rowsReturned: 0, errorSample: undefined };
+  return {
+    shape,
+    latencies: [],
+    ok: 0,
+    failed: 0,
+    rowsReturned: 0,
+    networkFailures: 0,
+    errorSample: undefined,
+  };
 }
 
 interface PageSample {
@@ -184,39 +185,30 @@ interface PageSample {
   readonly rows: number;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 // ---------------------------------------------------------------
 // Phase 1: shape latency
 // ---------------------------------------------------------------
 
 async function runShape(m: ShapeMetrics, record: boolean): Promise<void> {
-  const t0 = performance.now();
-  try {
-    const res = await fetch(`${LOGS_URL}?${m.shape.query}`, { headers: HEADERS });
-    const elapsed = performance.now() - t0;
-    if (res.status === 200) {
-      const body = (await res.json()) as { logs: unknown[] };
-      if (record) {
-        m.ok++;
-        m.rowsReturned += body.logs.length;
-        m.latencies.push(elapsed);
-      }
-    } else {
-      const text = await res.text();
-      if (record) {
-        m.failed++;
-        m.latencies.push(elapsed);
-        m.errorSample ??= `HTTP ${res.status}: ${text.slice(0, 140)}`;
-      }
-    }
-  } catch (err) {
-    if (record) {
-      m.failed++;
-      m.errorSample ??= `network: ${(err as Error).message}`;
-    }
+  const res = await timedFetch(`${LOGS_URL}?${m.shape.query}`, {
+    headers: HEADERS,
+  });
+  if (!record) return;
+
+  if (!res.ok) {
+    m.failed++;
+    m.networkFailures++;
+    m.errorSample ??= `network: ${res.error}`;
+    return;
+  }
+
+  m.latencies.push(res.elapsedMs);
+  if (res.status === 200) {
+    m.ok++;
+    m.rowsReturned += parseJson<{ logs: unknown[] }>(res)?.logs.length ?? 0;
+  } else {
+    m.failed++;
+    m.errorSample ??= `HTTP ${res.status}: ${res.text.slice(0, 140)}`;
   }
 }
 
@@ -263,48 +255,26 @@ async function paginationWalk(): Promise<PageSample[]> {
     const qs = new URLSearchParams({ limit: String(LIMIT) });
     if (cursor !== null) qs.set('cursor', cursor);
 
-    const t0 = performance.now();
-    const res = await fetch(`${LOGS_URL}?${qs.toString()}`, { headers: HEADERS });
-    const elapsed = performance.now() - t0;
-
-    if (res.status !== 200) {
-      const text = await res.text();
-      throw new Error(`Pagination failed at page ${page}: HTTP ${res.status} ${text.slice(0, 140)}`);
+    const res = await timedFetch(`${LOGS_URL}?${qs.toString()}`, {
+      headers: HEADERS,
+    });
+    if (!res.ok || res.status !== 200) {
+      throw new Error(
+        `Pagination failed at page ${page}: ` +
+          (res.ok ? `HTTP ${res.status} ${res.text.slice(0, 140)}` : res.error),
+      );
     }
-    const body = (await res.json()) as {
-      logs: unknown[];
-      next_cursor: string | null;
-    };
-    samples.push({ page, ms: elapsed, rows: body.logs.length });
+    const body = parseJson<{ logs: unknown[]; next_cursor: string | null }>(res);
+    if (body === undefined) {
+      throw new Error(`Pagination page ${page} returned unparseable JSON`);
+    }
+    samples.push({ page, ms: res.elapsedMs, rows: body.logs.length });
 
     if (body.next_cursor === null) break; // ran out of data
     cursor = body.next_cursor;
   }
 
   return samples;
-}
-
-// ---------------------------------------------------------------
-// Health gate
-// ---------------------------------------------------------------
-
-async function waitForHealth(): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  process.stdout.write(`Waiting for ${HEALTH_URL} ... `);
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(HEALTH_URL);
-      if (res.status === 200) {
-        await res.text();
-        process.stdout.write('ready.\n');
-        return;
-      }
-    } catch {
-      // not up yet
-    }
-    await sleep(500);
-  }
-  throw new Error(`Service did not become healthy at ${HEALTH_URL}`);
 }
 
 // ---------------------------------------------------------------
@@ -323,6 +293,7 @@ function printReport(
   const overall = summarizeLatencies(pooled);
   const totalReq = metrics.reduce((n, m) => n + m.ok + m.failed, 0);
   const totalFailed = metrics.reduce((n, m) => n + m.failed, 0);
+  const totalNetworkFailures = metrics.reduce((n, m) => n + m.networkFailures, 0);
 
   console.log(`\n${line}`);
   console.log('  QUERY LATENCY REPORT — GET /logs');
@@ -359,7 +330,7 @@ function printReport(
   }
   console.log('');
   console.log('  Phase 1 — pooled latency');
-  console.log(formatLatencyBlock(overall));
+  console.log(formatLatencyBlock(overall, totalNetworkFailures));
   console.log(`  achieved rate : ${fmtNum(totalReq / phase1Sec)} req/s ` +
     `over ${fmtNum(phase1Sec)}s (${fmtInt(totalFailed)} failed)`);
   console.log('');
@@ -435,7 +406,7 @@ async function main(): Promise<void> {
       `pages=${PAGES} window=${WINDOW_HOURS}h`,
   );
 
-  await waitForHealth();
+  await waitForHealth(URL_BASE);
 
   process.stdout.write('Discovering dataset ... ');
   const ds = await discoverDataset(URL_BASE, HEADERS, WINDOW_HOURS, UNTIL_OVERRIDE);

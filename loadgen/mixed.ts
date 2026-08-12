@@ -51,57 +51,47 @@ import {
   fmtNum,
   fmtMs,
 } from './report.js';
+import {
+  authHeaders,
+  baseUrl,
+  envInt,
+  envNum,
+  envStr,
+  parseJson,
+  pick,
+  randInt,
+  sleep,
+  timedFetch,
+  waitForHealth,
+} from './util.js';
 
 // ---------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------
 
-function envInt(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return dflt;
-  const n = Number.parseInt(raw, 10);
-  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
-  return n;
-}
-
-function envNum(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return dflt;
-  const n = Number.parseFloat(raw);
-  if (Number.isNaN(n) || n <= 0) throw new Error(`Invalid ${name}: '${raw}'`);
-  return n;
-}
-
-const URL_BASE = (process.env['LOADGEN_URL'] ?? 'http://localhost:8080').replace(
-  /\/$/,
-  '',
-);
+const URL_BASE = baseUrl();
 const DURATION_SEC = envInt('LOADGEN_DURATION_SEC', 60);
-const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5);
+const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5, 0);
 const BATCH_SIZE = envInt('LOADGEN_BATCH_SIZE', 500);
 const CONCURRENCY = envInt('LOADGEN_CONCURRENCY', 16);
 const AGG_RATE = envNum('LOADGEN_AGG_RATE', 1);
 const WINDOW_HOURS = envInt('LOADGEN_WINDOW_HOURS', 1);
 const FRESHNESS_EVERY_SEC = envInt('LOADGEN_FRESHNESS_EVERY_SEC', 10);
-const API_KEY = process.env['LOADGEN_API_KEY'];
+const API_KEY = envStr('LOADGEN_API_KEY');
 
 const INGEST_URL = `${URL_BASE}/logs`;
 const QUERY_URL = `${URL_BASE}/logs`;
 const AGG_URL = `${URL_BASE}/logs/aggregate`;
-const HEALTH_URL = `${URL_BASE}/health`;
 
 // Spec targets this run is judged against.
 const AGG_P95_TARGET_MS = 1000;
 const FRESHNESS_TARGET_MS = 20_000;
 
+const GET_HEADERS: Record<string, string> = authHeaders();
 const JSON_HEADERS: Record<string, string> = {
   'content-type': 'application/json',
+  ...GET_HEADERS,
 };
-const GET_HEADERS: Record<string, string> = {};
-if (API_KEY) {
-  JSON_HEADERS['authorization'] = `Bearer ${API_KEY}`;
-  GET_HEADERS['authorization'] = `Bearer ${API_KEY}`;
-}
 
 // ---------------------------------------------------------------
 // Synthetic data
@@ -118,14 +108,6 @@ const MESSAGES = [
   'cache miss', 'database timeout', 'rate limited', 'validation failed',
   'connection reset', 'order placed', 'token refreshed',
 ];
-
-function pick<T>(arr: readonly T[]): T {
-  return arr[Math.floor(Math.random() * arr.length)]!;
-}
-
-function randInt(maxExclusive: number): number {
-  return Math.floor(Math.random() * maxExclusive);
-}
 
 function makeBatchBody(nowMs: number): string {
   const logs = new Array(BATCH_SIZE);
@@ -159,11 +141,13 @@ interface Metrics {
   ingestFailed: number;
   logsAccepted: number;
   ingestLatencies: number[];
+  ingestNetworkFailures: number;
   // aggregate
   aggRequests: number;
   aggOk: number;
   aggFailed: number;
   aggLatencies: number[];
+  aggNetworkFailures: number;
   // The aggregation driver's own active window. The achieved rate must
   // be computed against THIS, not the run's total wall time: Promise.all
   // keeps the phase alive until every ingest worker drains its in-flight
@@ -181,8 +165,8 @@ interface Metrics {
 function newMetrics(): Metrics {
   return {
     ingestRequests: 0, ingestOk: 0, ingestThrottled: 0, ingestFailed: 0,
-    logsAccepted: 0, ingestLatencies: [],
-    aggRequests: 0, aggOk: 0, aggFailed: 0, aggLatencies: [],
+    logsAccepted: 0, ingestLatencies: [], ingestNetworkFailures: 0,
+    aggRequests: 0, aggOk: 0, aggFailed: 0, aggLatencies: [], aggNetworkFailures: 0,
     aggStartMs: 0, aggEndMs: 0,
     freshnessSamples: [], freshnessTimeouts: 0,
     errorSamples: [],
@@ -191,10 +175,6 @@ function newMetrics(): Metrics {
 
 function noteError(m: Metrics, msg: string): void {
   if (m.errorSamples.length < 8) m.errorSamples.push(msg);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 // ---------------------------------------------------------------
@@ -208,39 +188,29 @@ async function ingestWorker(
 ): Promise<void> {
   while (!done()) {
     const body = makeBatchBody(Date.now());
-    const t0 = performance.now();
-    try {
-      const res = await fetch(INGEST_URL, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body,
-      });
-      const elapsed = performance.now() - t0;
+    const res = await timedFetch(INGEST_URL, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body,
+    });
+    if (!record) continue;
 
-      if (res.status === 200) {
-        const json = (await res.json()) as { accepted?: number };
-        if (record) {
-          m.ingestOk++;
-          m.logsAccepted += json.accepted ?? 0;
-        }
-      } else {
-        const text = await res.text();
-        if (record) {
-          if (res.status === 429) m.ingestThrottled++;
-          else m.ingestFailed++;
-          noteError(m, `ingest HTTP ${res.status}: ${text.slice(0, 120)}`);
-        }
-      }
-      if (record) {
-        m.ingestRequests++;
-        m.ingestLatencies.push(elapsed);
-      }
-    } catch (err) {
-      if (record) {
-        m.ingestRequests++;
-        m.ingestFailed++;
-        noteError(m, `ingest network: ${(err as Error).message}`);
-      }
+    m.ingestRequests++;
+    if (!res.ok) {
+      m.ingestFailed++;
+      m.ingestNetworkFailures++;
+      noteError(m, `ingest network: ${res.error}`);
+      continue;
+    }
+
+    m.ingestLatencies.push(res.elapsedMs);
+    if (res.status === 200) {
+      m.ingestOk++;
+      m.logsAccepted += parseJson<{ accepted?: number }>(res)?.accepted ?? 0;
+    } else {
+      if (res.status === 429) m.ingestThrottled++;
+      else m.ingestFailed++;
+      noteError(m, `ingest HTTP ${res.status}: ${res.text.slice(0, 120)}`);
     }
   }
 }
@@ -280,32 +250,23 @@ async function aggregateDriver(
       group_by: 'service',
     });
 
-    const t0 = performance.now();
-    try {
-      const res = await fetch(`${AGG_URL}?${qs.toString()}`, {
-        headers: GET_HEADERS,
-      });
-      const elapsed = performance.now() - t0;
-      if (res.status === 200) {
-        await res.json();
-        if (record) m.aggOk++;
-      } else {
-        const text = await res.text();
-        if (record) {
-          m.aggFailed++;
-          noteError(m, `aggregate HTTP ${res.status}: ${text.slice(0, 120)}`);
-        }
-      }
-      if (record) {
-        m.aggRequests++;
-        m.aggLatencies.push(elapsed);
-      }
-    } catch (err) {
-      if (record) {
-        m.aggRequests++;
-        m.aggFailed++;
-        noteError(m, `aggregate network: ${(err as Error).message}`);
-      }
+    const res = await timedFetch(`${AGG_URL}?${qs.toString()}`, {
+      headers: GET_HEADERS,
+    });
+    if (!record) continue;
+
+    m.aggRequests++;
+    if (!res.ok) {
+      m.aggFailed++;
+      m.aggNetworkFailures++;
+      noteError(m, `aggregate network: ${res.error}`);
+      continue;
+    }
+    m.aggLatencies.push(res.elapsedMs);
+    if (res.status === 200) m.aggOk++;
+    else {
+      m.aggFailed++;
+      noteError(m, `aggregate HTTP ${res.status}: ${res.text.slice(0, 120)}`);
     }
   }
 
@@ -344,59 +305,59 @@ async function freshnessDriver(
     const marker = `freshness-${Date.now()}-${probe++}`;
     const t0 = performance.now();
 
-    try {
-      const res = await fetch(INGEST_URL, {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify({
-          logs: [
-            {
-              timestamp: new Date().toISOString(),
-              level: 'info',
-              service: marker,
-              message: 'freshness probe',
-            },
-          ],
-        }),
-      });
-      if (res.status !== 200) {
-        await res.text();
-        if (record) noteError(m, `freshness write HTTP ${res.status}`);
-        continue;
-      }
-      await res.json();
-
-      // Poll until visible or the target elapses. A 250ms interval is
-      // fine-grained enough to resolve a sub-second result without
-      // adding meaningful load next to the ingest workers.
-      let visible = false;
-      while (performance.now() - t0 < FRESHNESS_TARGET_MS) {
-        const q = await fetch(
-          `${QUERY_URL}?service=${encodeURIComponent(marker)}&limit=1`,
-          { headers: GET_HEADERS },
-        );
-        if (q.status === 200) {
-          const body = (await q.json()) as { logs: unknown[] };
-          if (body.logs.length > 0) {
-            visible = true;
-            break;
-          }
-        } else {
-          await q.text();
-        }
-        await sleep(250);
-      }
-
-      const elapsed = performance.now() - t0;
+    const write = await timedFetch(INGEST_URL, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        logs: [
+          {
+            timestamp: new Date().toISOString(),
+            level: 'info',
+            service: marker,
+            message: 'freshness probe',
+          },
+        ],
+      }),
+    });
+    if (!write.ok || write.status !== 200) {
       if (record) {
-        if (visible) m.freshnessSamples.push(elapsed);
-        else {
-          m.freshnessTimeouts++;
-          noteError(m, `freshness probe not visible within ${FRESHNESS_TARGET_MS}ms`);
+        noteError(
+          m,
+          `freshness write ${write.ok ? `HTTP ${write.status}` : write.error}`,
+        );
+      }
+      continue;
+    }
+
+    // Poll until visible or the target elapses. 250ms is fine enough to
+    // resolve a sub-second result without adding load next to the
+    // ingest workers.
+    let visible = false;
+    while (performance.now() - t0 < FRESHNESS_TARGET_MS) {
+      const q = await timedFetch(
+        `${QUERY_URL}?service=${encodeURIComponent(marker)}&limit=1`,
+        { headers: GET_HEADERS },
+      );
+      if (q.ok && q.status === 200) {
+        const body = parseJson<{ logs: unknown[] }>(q);
+        if (body !== undefined && body.logs.length > 0) {
+          visible = true;
+          break;
         }
       }
-    } catch (err) {
-      if (record) noteError(m, `freshness: ${(err as Error).message}`);
+      await sleep(250);
+    }
+
+    const elapsed = performance.now() - t0;
+    if (record) {
+      if (visible) m.freshnessSamples.push(elapsed);
+      else {
+        m.freshnessTimeouts++;
+        noteError(
+          m,
+          `freshness probe not visible within ${FRESHNESS_TARGET_MS}ms`,
+        );
+      }
     }
   }
 }
@@ -421,25 +382,6 @@ async function runPhase(
   if (record) tasks.push(freshnessDriver(m, record, done));
 
   await Promise.all(tasks);
-}
-
-async function waitForHealth(): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  process.stdout.write(`Waiting for ${HEALTH_URL} ... `);
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(HEALTH_URL);
-      if (res.status === 200) {
-        await res.text();
-        process.stdout.write('ready.\n');
-        return;
-      }
-    } catch {
-      // not up yet
-    }
-    await sleep(500);
-  }
-  throw new Error(`Service did not become healthy at ${HEALTH_URL}`);
 }
 
 // ---------------------------------------------------------------
@@ -477,6 +419,9 @@ function printReport(m: Metrics, wallSec: number): void {
   console.log(`    logs accepted : ${fmtInt(m.logsAccepted)}  (${fmtInt(acceptedPerSec)}/s)`);
   console.log(`    latency p50   : ${fmtMs(ing.p50)}`);
   console.log(`    latency p95   : ${fmtMs(ing.p95)}`);
+  if (m.ingestNetworkFailures > 0) {
+    console.log(`    excluded      : ${fmtInt(m.ingestNetworkFailures)} network failures (no latency sample)`);
+  }
   console.log('');
 
   console.log('  Aggregation (during sustained ingestion)  <-- the grading scenario');
@@ -484,7 +429,7 @@ function printReport(m: Metrics, wallSec: number): void {
     `(${fmtInt(m.aggOk)} ok, ${fmtInt(m.aggFailed)} failed)`);
   console.log(`    achieved rate : ${fmtNum(aggRateAchieved)} req/s ` +
     `(offered ${fmtNum(AGG_RATE)}/s over ${fmtNum(aggWindowSec)}s)`);
-  console.log(formatLatencyBlock(agg));
+  console.log(formatLatencyBlock(agg, m.aggNetworkFailures));
   console.log('');
 
   console.log('  Freshness (write -> readable, full round trip)');
@@ -539,7 +484,7 @@ async function main(): Promise<void> {
       `agg=${AGG_RATE}/s freshness=every ${FRESHNESS_EVERY_SEC}s`,
   );
 
-  await waitForHealth();
+  await waitForHealth(URL_BASE);
 
   if (WARMUP_SEC > 0) {
     console.log(`\nWarmup ${WARMUP_SEC}s (not recorded)...`);

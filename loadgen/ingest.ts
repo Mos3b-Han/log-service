@@ -47,48 +47,44 @@ import {
   fmtNum,
   fmtBytes,
 } from './report.js';
+import {
+  authHeaders,
+  baseUrl,
+  envInt,
+  envStr,
+  pick,
+  randInt,
+  parseJson,
+  timedFetch,
+  waitForHealth,
+} from './util.js';
 
 // ---------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------
 
-function envInt(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return dflt;
-  const n = Number.parseInt(raw, 10);
-  if (Number.isNaN(n) || n <= 0) {
-    throw new Error(`Invalid ${name}: '${raw}'`);
-  }
-  return n;
-}
-
-const URL_BASE = process.env['LOADGEN_URL'] ?? 'http://localhost:8080';
+const URL_BASE = baseUrl();
 const BATCH_SIZE = envInt('LOADGEN_BATCH_SIZE', 500);
 const CONCURRENCY = envInt('LOADGEN_CONCURRENCY', 16);
 const DURATION_SEC = envInt('LOADGEN_DURATION_SEC', 30);
-const WARMUP_SEC = process.env['LOADGEN_WARMUP_SEC']
-  ? envInt('LOADGEN_WARMUP_SEC', 5)
-  : 5;
-const TOTAL_LOGS = process.env['LOADGEN_TOTAL_LOGS']
+const WARMUP_SEC = envInt('LOADGEN_WARMUP_SEC', 5, 0);
+const TOTAL_LOGS = envStr('LOADGEN_TOTAL_LOGS')
   ? envInt('LOADGEN_TOTAL_LOGS', 0)
   : undefined;
-const API_KEY = process.env['LOADGEN_API_KEY'];
-const SPREAD_DAYS = process.env['LOADGEN_SPREAD_DAYS']
-  ? envInt('LOADGEN_SPREAD_DAYS', 0)
-  : 0;
+const API_KEY = envStr('LOADGEN_API_KEY');
+const SPREAD_DAYS = envInt('LOADGEN_SPREAD_DAYS', 0, 0);
 
 // How far back entry timestamps may fall. Default is the last 60
 // seconds (live-stream shape); LOADGEN_SPREAD_DAYS widens it to build
 // a historical dataset for read-latency testing.
 const SPREAD_MS = SPREAD_DAYS > 0 ? SPREAD_DAYS * 86_400_000 : 60_000;
 
-const INGEST_URL = `${URL_BASE.replace(/\/$/, '')}/logs`;
-const HEALTH_URL = `${URL_BASE.replace(/\/$/, '')}/health`;
+const INGEST_URL = `${URL_BASE}/logs`;
 
 const HEADERS: Record<string, string> = {
   'content-type': 'application/json',
+  ...authHeaders(),
 };
-if (API_KEY) HEADERS['authorization'] = `Bearer ${API_KEY}`;
 
 // ---------------------------------------------------------------
 // Synthetic data
@@ -105,21 +101,6 @@ const MESSAGES = [
   'cache miss', 'database timeout', 'rate limited', 'validation failed',
   'connection reset', 'order placed', 'token refreshed',
 ];
-
-function pick<T>(arr: readonly T[]): T {
-  return arr[(Math.random() * arr.length) | 0]!;
-}
-
-// Math.floor, not `| 0`. The bitwise form coerces through ToInt32, so
-// any value above 2^31-1 wraps to a negative number. That is harmless
-// for small ranges but silently breaks LOADGEN_SPREAD_DAYS: a 30-day
-// spread is 2,592,000,000 ms, past the int32 limit, so ~17% of draws
-// came back negative and `now - negative` produced FUTURE timestamps
-// that the service then correctly rejected -- making a working service
-// look like it was dropping 17% of a valid workload.
-function randInt(maxExclusive: number): number {
-  return Math.floor(Math.random() * maxExclusive);
-}
 
 interface WireEntry {
   timestamp: string;
@@ -166,7 +147,12 @@ interface Metrics {
   logsSent: number;
   logsAccepted: number;
   bytesSent: number;
-  latencies: number[]; // ms, per request
+  latencies: number[]; // ms, per request that produced a response
+  // Requests that failed before a response arrived, and therefore
+  // contributed no latency sample. Tracked separately so the report can
+  // say so out loud: percentiles computed over survivors alone look
+  // better than reality precisely when a server is struggling.
+  networkFailures: number;
   firstErrorSamples: string[];
 }
 
@@ -174,7 +160,7 @@ function newMetrics(): Metrics {
   return {
     requests: 0, ok: 0, rejected: 0, throttled: 0, failed: 0,
     logsSent: 0, logsAccepted: 0, bytesSent: 0,
-    latencies: [], firstErrorSamples: [],
+    latencies: [], networkFailures: 0, firstErrorSamples: [],
   };
 }
 
@@ -196,48 +182,42 @@ async function runWorker(m: Metrics, opts: PhaseOpts): Promise<void> {
     const body = makeBatchBody(nowMs);
     const bytes = Buffer.byteLength(body);
 
-    const t0 = performance.now();
-    try {
-      const res = await fetch(INGEST_URL, {
-        method: 'POST',
-        headers: HEADERS,
-        body,
-      });
-      const elapsed = performance.now() - t0;
+    const res = await timedFetch(INGEST_URL, {
+      method: 'POST',
+      headers: HEADERS,
+      body,
+    });
 
-      // Always drain the body so the socket is freed for keep-alive
-      // reuse; parse it only when we need the accepted count.
-      if (res.status === 200) {
-        const json = (await res.json()) as { accepted?: number };
-        if (opts.record) {
-          m.ok++;
-          m.logsAccepted += json.accepted ?? 0;
-        }
-      } else {
-        const text = await res.text();
-        if (opts.record) {
-          if (res.status === 429) m.throttled++;
-          else if (res.status === 400) m.rejected++;
-          else m.failed++;
-          if (m.firstErrorSamples.length < 5) {
-            m.firstErrorSamples.push(`HTTP ${res.status}: ${text.slice(0, 120)}`);
-          }
-        }
-      }
+    if (!opts.record) continue;
 
-      if (opts.record) {
-        m.requests++;
-        m.logsSent += BATCH_SIZE;
-        m.bytesSent += bytes;
-        m.latencies.push(elapsed);
+    m.requests++;
+    m.logsSent += BATCH_SIZE;
+    m.bytesSent += bytes;
+
+    if (!res.ok) {
+      // Never reached the server: counted as failed, but deliberately
+      // kept out of the latency distribution.
+      m.failed++;
+      m.networkFailures++;
+      if (m.firstErrorSamples.length < 5) {
+        m.firstErrorSamples.push(`network: ${res.error}`);
       }
-    } catch (err) {
-      if (opts.record) {
-        m.requests++;
-        m.failed++;
-        if (m.firstErrorSamples.length < 5) {
-          m.firstErrorSamples.push(`network: ${(err as Error).message}`);
-        }
+      continue;
+    }
+
+    m.latencies.push(res.elapsedMs);
+
+    if (res.status === 200) {
+      m.ok++;
+      m.logsAccepted += parseJson<{ accepted?: number }>(res)?.accepted ?? 0;
+    } else {
+      if (res.status === 429) m.throttled++;
+      else if (res.status === 400) m.rejected++;
+      else m.failed++;
+      if (m.firstErrorSamples.length < 5) {
+        m.firstErrorSamples.push(
+          `HTTP ${res.status}: ${res.text.slice(0, 120)}`,
+        );
       }
     }
   }
@@ -280,29 +260,6 @@ function startProgress(m: Metrics, startMs: number): NodeJS.Timeout {
 }
 
 // ---------------------------------------------------------------
-// Health gate
-// ---------------------------------------------------------------
-
-async function waitForHealth(): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  process.stdout.write(`Waiting for ${HEALTH_URL} ... `);
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(HEALTH_URL);
-      if (res.status === 200) {
-        await res.text();
-        process.stdout.write('ready.\n');
-        return;
-      }
-    } catch {
-      // not up yet
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  throw new Error(`Service did not become healthy at ${HEALTH_URL}`);
-}
-
-// ---------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------
 
@@ -339,7 +296,7 @@ function printReport(m: Metrics, wallSec: number): void {
   console.log(`    data sent    : ${fmtBytes(m.bytesSent)}`);
   console.log('');
   console.log('  Latency (per request)');
-  console.log(formatLatencyBlock(lat));
+  console.log(formatLatencyBlock(lat, m.networkFailures));
   console.log('');
   console.log('  Verdict');
   console.log(`    target       : ${fmtInt(target)} logs/s`);
@@ -371,7 +328,7 @@ async function main(): Promise<void> {
       ` batch=${BATCH_SIZE} concurrency=${CONCURRENCY}`,
   );
 
-  await waitForHealth();
+  await waitForHealth(URL_BASE);
 
   // Warmup (duration mode only): send real traffic without recording,
   // so JIT, connection pools, and the server's write buffers are all

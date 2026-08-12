@@ -17,6 +17,8 @@
 // "busiest service" rule below replaced a naive "first row's service"
 // version that silently made one query shape meaningless.
 
+import { parseJson, timedFetch } from './util.js';
+
 export interface Dataset {
   /** Upper bound for every query range: the newest row's timestamp. */
   readonly end: Date;
@@ -66,17 +68,15 @@ export async function discoverDataset(
   const logsUrl = `${baseUrl}/logs`;
   const aggUrl = `${baseUrl}/logs/aggregate`;
 
-  const res = await fetch(`${logsUrl}?limit=1`, { headers });
-  if (res.status !== 200) {
+  const res = await timedFetch(`${logsUrl}?limit=1`, { headers });
+  if (!res.ok || res.status !== 200) {
     throw new Error(
-      `Dataset discovery failed: GET /logs returned ${res.status}. ` +
-        (res.status === 401
-          ? 'Auth is enabled; set LOADGEN_API_KEY.'
-          : await res.text()),
+      `Dataset discovery failed: GET /logs returned ${res.ok ? res.status : res.error}. ` +
+        (res.status === 401 ? 'Auth is enabled; set LOADGEN_API_KEY.' : res.text),
     );
   }
-  const body = (await res.json()) as { logs: WireLogRow[] };
-  const row = body.logs[0];
+  const body = parseJson<{ logs: WireLogRow[] }>(res);
+  const row = body?.logs[0];
   if (row === undefined) {
     throw new Error(
       'The service holds no logs. Run `npx tsx loadgen/ingest.ts` first ' +
@@ -126,15 +126,15 @@ async function busiestService(
     bucket: '1d',
     group_by: 'service',
   });
-  const res = await fetch(`${aggUrl}?${qs.toString()}`, { headers });
-  if (res.status !== 200) {
+  const res = await timedFetch(`${aggUrl}?${qs.toString()}`, { headers });
+  if (!res.ok || res.status !== 200) {
     throw new Error(
-      `Service discovery failed: GET /logs/aggregate returned ${res.status}`,
+      `Service discovery failed: GET /logs/aggregate returned ${res.ok ? res.status : res.error}`,
     );
   }
-  const body = (await res.json()) as {
+  const body = parseJson<{
     buckets: { group: string | null; count: number }[];
-  };
+  }>(res) ?? { buckets: [] };
 
   const totals = new Map<string, number>();
   for (const b of body.buckets) {
